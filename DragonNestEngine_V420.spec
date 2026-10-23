@@ -4,7 +4,6 @@ from pathlib import Path
 datas = [
     ('dragon_nest_builder\\data\\modular', 'dragon_nest_builder\\data\\modular'),
     ('dragon_nest_builder\\data\\live_dps_profiles', 'dragon_nest_builder\\data\\live_dps_profiles'),
-    ('dragon_nest_builder\\assets', 'dragon_nest_builder\\assets'),
     ('tools\\capture_live_dps_v576.ps1', 'tools'),
 ]
 
@@ -24,11 +23,11 @@ a = Analysis(
     # methods at runtime behind Qt placeholders.  PyInstaller cannot discover
     # that importlib-based dependency, so the frozen engine must include it
     # explicitly even though the actual Qt runtime remains excluded.
+    # The countdown build has no Qt UI and no scoring pipeline, so neither the
+    # desktop page nor the team-score dialog needs to be frozen in.
     hiddenimports=[
         'win32timezone',
         'html',
-        'dragon_nest_builder.ui.live_dps_page',
-        'dragon_nest_builder.ui.team_score_sync_dialog',
     ],
     hookspath=[],
     hooksconfig={},

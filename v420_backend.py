@@ -1,11 +1,8 @@
 from __future__ import annotations
 
 import argparse
-import copy
 import ctypes
-import dataclasses
 import faulthandler
-import hashlib
 import http.client
 import json
 import multiprocessing
@@ -20,7 +17,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, urlparse
 
 
 _BACKEND_DIAGNOSTIC_HANDLE: Any | None = None
@@ -282,37 +279,25 @@ os.environ["DRAGON_NEST_APP_VERSION"] = VERSION
 # newly built frontend can silently reuse a backend which lacks newer routes.
 # Bump this value whenever the local HTTP contract changes.
 BACKEND_PRODUCT = "dragon-nest-battle-platform"
-BACKEND_API_REVISION = "20260923-database-character-percentile"
+BACKEND_API_REVISION = "20261023-countdown-only"
+# Advertised so a freshly built frontend never silently pairs with an older
+# engine.  The countdown build exposes capture control, the two overlay
+# snapshots, voice events and the Npcap path - nothing else.
 BACKEND_API_CAPABILITIES = frozenset(
     {
-        "anonymous-usage-dashboard",
-        "anonymous-usage-events-v2",
-        "character-score-history",
-        "crash-diagnostic-cloud-upload-v1",
-        "database-profession-ranking-v1",
-        "database-ranking-center-v2",
-        "database-ranking-character-query-v1",
-        "movement-ledger-v1",
-        "profession-score-history",
-        "profession-score-history-detail",
-        "profile-score-overlay-privacy-v1",
-        "profile-score-privacy-scopes-v2",
-        "score-history-cursor-v2",
+        "capture-control-v1",
+        "capture-toggles-v1",
+        "overlay-buff-debuff-v1",
+        "overlay-boss-skill-v1",
+        "overlay-wait-v1",
+        "voice-events-v1",
+        "npcap-path-v2",
     }
 )
 
 from dragon_nest_builder.calculator import BuildCalculator
-from dragon_nest_builder.crash_diagnostic_upload import (
-    crash_diagnostic_upload_status,
-    start_crash_diagnostic_uploader,
-    stop_crash_diagnostic_uploader,
-)
 from dragon_nest_builder.data_loader import DataStore, as_number
-from dragon_nest_builder.live_dps.movement_map_assets import (
-    movement_map_asset_path,
-)
 from dragon_nest_builder.live_dps import npcap_config
-from dragon_nest_builder.live_dps.v410_score_sync import load_v410_score_sync_config
 from dragon_nest_builder.v410_native_core import NativeSimulatorCore
 
 
@@ -538,27 +523,14 @@ def _bind_server_or_wait_for_takeover(
             time.sleep(BACKEND_TAKEOVER_POLL_SECONDS)
 
 
-def _job_key(kind: str, payload: dict[str, Any]) -> str:
-    frozen = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    return f"{kind}:{hashlib.sha256(frozen.encode('utf-8')).hexdigest()}"
-
-
-MODULES = [
-    {"id": "build1", "label": "配装1", "group": "build", "status": "native"},
-    {"id": "build2", "label": "配装2", "group": "build", "status": "native"},
-    {"id": "compare", "label": "配装对比", "group": "build", "status": "native"},
-    {"id": "skill-build", "label": "加点模拟", "group": "skills", "status": "native"},
-    {"id": "skill-sim", "label": "技能模拟", "group": "skills", "status": "native"},
-    {"id": "team", "label": "配队模拟", "group": "team", "status": "native"},
-    {"id": "live", "label": "实战统计", "group": "live", "status": "native"},
-]
-
-
 class Engine:
-    """Window-free application service used by the current frontend."""
+    """Window-free application service: capture core only."""
 
     def __init__(self) -> None:
         started = time.perf_counter()
+        # The capture core needs the data store and a calculator instance for
+        # protocol catalogs and profile labels; no HTTP route exposes build
+        # calculation any more.
         self.store = DataStore.load()
         self.calculator = BuildCalculator(self.store)
         self.native = NativeSimulatorCore(self.store, self.calculator)
@@ -568,49 +540,8 @@ class Engine:
         self.loaded_ms = round((time.perf_counter() - started) * 1000, 1)
         self._lock = threading.RLock()
 
-    def bootstrap(self) -> dict[str, Any]:
-        first_jobs = self.store.first_jobs()
-        second_jobs = {job: self.store.second_jobs(job) for job in first_jobs}
-        first_by_base: dict[str, list[str]] = {}
-        for first_job in first_jobs:
-            children = second_jobs.get(first_job, [])
-            base_job = self.store.job_family(children[0], first_job) if children else ""
-            # Equipment data abbreviates the base Archer class as ``弓箭``;
-            # the history UI should use the in-game profession name.
-            if base_job == "弓箭":
-                base_job = "弓箭手"
-            if base_job:
-                first_by_base.setdefault(base_job, []).append(first_job)
-        return {
-            "version": VERSION,
-            "title": f"龙之谷ACT（高级战斗追踪器）工具及模拟工具 V{VERSION}",
-            "engine": {
-                "status": "ready",
-                "loadedMs": self.loaded_ms,
-                "source": f"Python V{VERSION} window-free core",
-            },
-            "modules": MODULES,
-            "jobs": {
-                "base": list(first_by_base),
-                "first": first_jobs,
-                "second": second_jobs,
-                "firstByBase": first_by_base,
-            },
-        }
-
     def shutdown(self) -> None:
         self.native.shutdown()
-
-    def calculate(self, build: dict[str, Any]) -> dict[str, Any]:
-        started = time.perf_counter()
-        with self._lock:
-            rows, summary = self.calculator.calculate(copy.deepcopy(build))
-        return {
-            "rows": [dataclasses.asdict(row) for row in rows],
-            "summary": summary,
-            "elapsedMs": round((time.perf_counter() - started) * 1000, 2),
-        }
-
 
 ENGINE: Engine | None = None
 
@@ -620,85 +551,6 @@ def get_engine() -> Engine:
     if ENGINE is None:
         ENGINE = Engine()
     return ENGINE
-
-
-def _score_job_dedupe_key(
-    core: NativeSimulatorCore,
-    payload: dict[str, Any],
-) -> str:
-    canonical = getattr(core, "score_job_dedupe_key", None)
-    if callable(canonical):
-        return str(canonical(payload))
-    return _job_key(
-        "replay-score",
-        {
-            "request": payload,
-            # Team-score theory uses the current build as its equipment/card
-            # template. Include it so a background prefetch cannot be reused
-            # after the user changes build1.
-            "build": core.get_build("build1"),
-        },
-    )
-
-
-def _start_score_job(
-    core: NativeSimulatorCore,
-    payload: dict[str, Any],
-    *,
-    label: str = "正在生成全队评分",
-) -> str:
-    canonical = getattr(core, "start_score_job", None)
-    if callable(canonical):
-        return str(canonical(payload, label=label))
-    requested_source_hash = str(payload.get("sourceHash") or "").strip()
-    resolver = getattr(core, "resolve_score_source_hash", None)
-    resolved_source_hash = (
-        resolver(requested_source_hash) if callable(resolver)
-        else requested_source_hash
-    )
-    if resolved_source_hash != requested_source_hash:
-        payload = {**payload, "sourceHash": resolved_source_hash}
-
-    def run_score(progress):
-        source_hash = str(payload.get("sourceHash") or "").strip()
-        if source_hash.startswith("live:"):
-            # Live scoring shares the machine with the game client. Two
-            # below-normal workers preserve capture/UI responsiveness and
-            # avoid the 8-16 process spikes used by offline replay scoring.
-            from dragon_nest_builder.timeline_parallel import timeline_worker_limit
-
-            with timeline_worker_limit(2):
-                return core.score_replay(payload, progress)
-        return core.score_replay(payload, progress)
-
-    return core.jobs.start(
-        label,
-        run_score,
-        kind="replay-score",
-        dedupe_key=_score_job_dedupe_key(core, payload),
-    )
-
-
-def _start_default_score_prefetch(
-    core: NativeSimulatorCore,
-    replay: dict[str, Any],
-) -> None:
-    if str(replay.get("scorePrefetchJobId") or "").strip():
-        return
-    source_hash = str(replay.get("sourceHash") or "").strip()
-    players = replay.get("players")
-    if not source_hash or not isinstance(players, list) or not players:
-        return
-    payload = {
-        "sourceHash": source_hash,
-        "bossTargetIds": [],
-        "glyphOverrides": {},
-    }
-    replay["scorePrefetchJobId"] = _start_score_job(
-        core,
-        payload,
-        label="正在后台预计算全队评分",
-    )
 
 
 class ApiHandler(BaseHTTPRequestHandler):
@@ -727,19 +579,6 @@ class ApiHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self._cors_headers()
         self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
-
-    def _write_file(self, path: Path, content_type: str) -> None:
-        if not path.is_file():
-            self._write_json({"error": "asset_not_found"}, HTTPStatus.NOT_FOUND)
-            return
-        data = path.read_bytes()
-        self.send_response(HTTPStatus.OK)
-        self._cors_headers()
-        self.send_header("Content-Type", content_type)
-        self.send_header("Cache-Control", "public, max-age=86400, immutable")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
@@ -913,12 +752,6 @@ def serve(host: str = HOST, port: int = DEFAULT_PORT) -> None:
     server = _bind_server_or_wait_for_takeover(host, port)
     engine = get_engine()
     _start_backend_state_heartbeat(engine)
-    start_crash_diagnostic_uploader(
-        load_v410_score_sync_config,
-        status_callback=lambda event, message: _write_backend_diagnostic(
-            f"Crash diagnostic cloud upload [{event}]: {message}"
-        ),
-    )
     pid_path = Path(__file__).resolve().parent / ".v420_backend_pid"
     pid_path.write_text(str(os.getpid()), encoding="ascii")
     _write_backend_diagnostic(
@@ -931,7 +764,6 @@ def serve(host: str = HOST, port: int = DEFAULT_PORT) -> None:
         pass
     finally:
         server.server_close()
-        stop_crash_diagnostic_uploader()
         global ENGINE
         engine = ENGINE
         ENGINE = None
