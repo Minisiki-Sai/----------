@@ -1,0 +1,52 @@
+# Python virtual environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.venv/
+
+# V4.10 Vue / Tauri build outputs
+frontend/node_modules/
+frontend/dist/
+frontend/src-tauri/target/
+frontend/src-tauri/gen/
+
+# Local verification artifacts
+v410_backend_test.log*
+*.pyd
+.pytest_cache/
+.mypy_cache/
+
+# IDE settings
+.idea/
+.vscode/
+
+# Build and packaging output
+build/
+dist/
+protected_build/
+protected_dist/
+outputs/
+exports/
+*.exe
+*.log
+
+# Temporary files
+*.tmp
+*.bak*
+~$*
+.DS_Store
+Thumbs.db
+
+# Local credentials and cloud deployment state
+.env
+.env.*
+!.env.example
+.dev.vars
+.wrangler/
+secrets.json
+dragon_nest_builder/data/modular/supabase_score_sync.json
+
+# Local user state
+skill_build_schemes/
+user_data/

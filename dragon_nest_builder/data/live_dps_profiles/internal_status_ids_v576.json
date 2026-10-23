@@ -1,0 +1,110 @@
+{
+  "profile": "v576",
+  "description": "Internal server status IDs observed by the live DPS decoder. Unknown IDs must not be guessed from value or timing alone.",
+  "statuses": {
+    "201536": {
+      "display_name": "铁壁后缀",
+      "source_type": "equipment_suffix",
+      "canonical_skill_id": null,
+      "effect": "物理防御-30%",
+      "duration_seconds": 10,
+      "evidence": "prefixwep_dnt_and_packet_parameters"
+    },
+    "201836": {
+      "display_name": "铁壁后缀",
+      "source_type": "equipment_suffix",
+      "canonical_skill_id": null,
+      "effect": "物理防御-30%",
+      "duration_seconds": 10,
+      "evidence": "packet_parameters_and_user_trigger_test"
+    },
+    "201936": {
+      "display_name": "铁壁后缀",
+      "source_type": "equipment_suffix",
+      "canonical_skill_id": null,
+      "effect": "物理防御-30%",
+      "duration_seconds": 10,
+      "evidence": "prefixwep_dnt_and_packet_parameters"
+    },
+    "200124": {
+      "display_name": "疾风后缀",
+      "source_type": "equipment_suffix",
+      "canonical_skill_id": null,
+      "effect": "致命一击抵抗按后缀等级降低（实测Lv13为-14.05%）",
+      "duration_seconds": 10,
+      "evidence": "prefixwep_dnt_and_packet_parameters"
+    },
+    "30612": {
+      "display_name": "雷电之手召唤物攻击",
+      "source_type": "summon_state",
+      "canonical_skill_id": 3409,
+      "evidence": "existing_decoder_mapping"
+    },
+    "30613": {
+      "display_name": "痊愈之手光攻增益",
+      "source_type": "summon_buff",
+      "canonical_skill_id": 3422,
+      "evidence": "existing_decoder_mapping"
+    },
+    "30614": {
+      "display_name": "掌握之手召唤物状态",
+      "source_type": "summon_state",
+      "canonical_skill_id": 3423,
+      "evidence": "existing_decoder_mapping"
+    },
+    "30615": {
+      "display_name": "奇迹之手保护状态",
+      "source_type": "summon_buff",
+      "canonical_skill_id": 3412,
+      "evidence": "existing_decoder_mapping"
+    },
+    "30616": {
+      "display_name": "雷电之手减光抗",
+      "source_type": "summon_debuff",
+      "canonical_skill_id": 3409,
+      "evidence": "existing_decoder_mapping"
+    },
+    "30619": {
+      "display_name": "掌握之手EX团队增伤",
+      "source_type": "summon_debuff",
+      "canonical_skill_id": 3423,
+      "evidence": "existing_decoder_mapping"
+    },
+    "30810": {
+      "display_name": "魔法草火焰攻击",
+      "source_type": "summon_state",
+      "canonical_skill_id": 4405,
+      "evidence": "existing_decoder_mapping"
+    },
+    "30812": {
+      "display_name": "魔法草中毒攻击",
+      "source_type": "summon_state",
+      "canonical_skill_id": 4405,
+      "evidence": "existing_decoder_mapping"
+    },
+    "30813": {
+      "display_name": "岩浆墙召唤物状态",
+      "source_type": "summon_state",
+      "canonical_skill_id": 4410,
+      "evidence": "existing_decoder_mapping"
+    },
+    "30820": {
+      "display_name": "灵魂之门召唤物状态",
+      "source_type": "summon_state",
+      "canonical_skill_id": 5216,
+      "evidence": "existing_decoder_mapping"
+    },
+    "30821": {
+      "display_name": "灵魂之门召唤物状态",
+      "source_type": "summon_state",
+      "canonical_skill_id": 5216,
+      "evidence": "existing_decoder_mapping"
+    },
+    "30822": {
+      "display_name": "灵魂之门召唤物状态",
+      "source_type": "summon_state",
+      "canonical_skill_id": 5216,
+      "evidence": "existing_decoder_mapping"
+    }
+  }
+}

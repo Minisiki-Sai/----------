@@ -1,0 +1,28 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>悬浮窗实际样式位置调整预览</title>
+<style>
+html.preview-page,html.preview-page body{height:auto!important;min-height:100%;overflow:auto!important;background:#dce7e8!important;font:14px 'Microsoft YaHei',sans-serif}
+#preview{padding:24px}#preview>h1{margin:0 0 8px;font-size:22px;color:#164e59}#preview>p{color:#42656b;margin:0 0 22px}.preview-grid{display:grid;grid-template-columns:repeat(3,minmax(440px,1fr));align-items:start;gap:24px}.preview-card{min-width:0}.preview-card>h2{font-size:14px;color:#31535c;margin:0 0 10px}.preview-surface{width:max-content;max-width:100%;background:linear-gradient(135deg,#abc4bc,#bdcec5 55%,#8eaaa1);border-radius:6px}.preview-teammate{width:326px;height:360px}.preview-history{width:440px;height:470px}@media(max-width:1450px){.preview-grid{grid-template-columns:repeat(2,minmax(440px,1fr))}}
+</style></head><body><div id="preview"></div>
+<script type="module">
+import { createApp, h } from 'vue';
+import BuffOverlay from '/src/components/BuffOverlay.vue';
+import TeammateInfoOverlay from '/src/components/TeammateInfoOverlay.vue';
+import TeammateHistoryOverlay from '/src/components/TeammateHistoryOverlay.vue';
+import { DEFAULT_BUFF_OVERLAY_SETTINGS, BUFF_OVERLAY_STORAGE_KEY } from '/src/utils/buffOverlaySettings.ts';
+// Isolated Vite preview origin only; no capture server or installed ACT settings.
+localStorage.setItem(BUFF_OVERLAY_STORAGE_KEY, JSON.stringify({ ...DEFAULT_BUFF_OVERLAY_SETTINGS,
+  showEffectCurveOverlay:true, showPersonalDpsOverlay:true, showCooldownOverlay:true, showSummonOverlay:true,
+  selectedCooldownBuffs:['时间加速','精神爆发','灼热火焰'], columnWidth:360, curveColumnWidth:420,
+}));
+document.documentElement.classList.add('preview-page');
+const cards=[['Buff / Debuff（按真实行高、列宽）',BuffOverlay,{view:'status'},''],
+ ['效果与 DPS 曲线（按真实图表高度）',BuffOverlay,{view:'curves'},''],
+ ['队友信息（实际宽 326）',TeammateInfoOverlay,{},'preview-teammate'],
+ ['关键 Buff CD',BuffOverlay,{view:'alerts'},''],
+ ['关键召唤物',BuffOverlay,{view:'summons'},''],
+ ['队友既往评分（实际 440 × 470）',TeammateHistoryOverlay,{},'preview-history']];
+createApp({render:()=>h('div',[
+ h('h1','调整位置时：直接显示模拟悬浮窗'),h('p','这是实际组件的示例数据预览。样式和尺寸计算与实战共用；拖动提示不增加窗口高度，示例不计入统计、评分或上传。'),
+ h('div',{class:'preview-grid'},cards.map(([title,component,props,extra])=>h('section',{class:'preview-card'},[
+ h('h2',title),h('div',{class:['preview-surface',extra]},[h(component,props)])])))])}).mount('#preview');
+</script></body></html>

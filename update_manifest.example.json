@@ -1,0 +1,13 @@
+{
+  "schema": "dragon-nest-update-manifest-v1",
+  "version": "4.522",
+  "display_version": "4.522",
+  "file_name": "龙之谷ACT（高级战斗追踪器）工具及模拟工具_4.522.0_x64-setup.exe",
+  "download_url": "https://dragonnest-d0gy32zvzd63b6c52-1473474041.ap-shanghai.app.tcloudbase.com/updates/releases/v4.522/%E9%BE%99%E4%B9%8B%E8%B0%B7ACT%EF%BC%88%E9%AB%98%E7%BA%A7%E6%88%98%E6%96%97%E8%BF%BD%E8%B8%AA%E5%99%A8%EF%BC%89%E5%B7%A5%E5%85%B7%E5%8F%8A%E6%A8%A1%E6%8B%9F%E5%B7%A5%E5%85%B7_4.522.0_x64-setup.exe",
+  "sha256": "c3d9cafec4f523c2d7aefb5cce0b4b81f9ddf5f73e85cb7a710ec644fa3aad20",
+  "file_size": 25170416,
+  "published_at": "2026-09-05T06:50:57Z",
+  "baidu_pan_url": "",
+  "baidu_pan_code": "",
+  "notes": "龙之谷ACT (高级战斗追踪器) 工具及模拟工具\nv4.522更新 重大更新，必须更新！！！\n1、优化了客机情况下的自动开始和自动结束\n2、修复了悬浮窗炼金冰层数错误的问题\n3、降低了实时抓包期间，悬浮窗的资源消耗、评分的资源消耗\n4、修复了悬浮窗中既往评分过少的bug\n5、优化了偶尔会出现人数异常增多的问题\n6、修复了加速器环境下悬浮窗数据后端到前端映射错误的bug\n7、增加统计使用人数功能\n8、进一步提高月主的评分，修复了猛砍站姿技能比例错误问题"
+}

@@ -1,0 +1,6 @@
+# Build-time only: install in an isolated Python 3.12 environment, never in ACT.
+# For RTX 50-series, install torch/torchaudio from the official cu128 index first.
+qwen-tts==0.1.1
+soundfile==0.14.0
+torch==2.8.0
+torchaudio==2.8.0

@@ -1,0 +1,13 @@
+{
+  "schema": "dragon-nest-team-score-benchmark-manifest-v1",
+  "version": "20260823-20260825T011853Z",
+  "score_schema_version": 20260823,
+  "generated_at": "2026-08-25T01:19:09.208208Z",
+  "file": "team-score-benchmarks-20260823-20260825T011853Z.json.gz",
+  "data_url": "https://dragonnest-d0gy32zvzd63b6c52-1473474041.ap-shanghai.app.tcloudbase.com/team-score-sync?asset=benchmark-catalog&version=20260823-20260825T011853Z",
+  "sha256": "6377a231bb956a9c89d75f61f283518432aa626af28abbca77e3a7b592ad0513",
+  "compression": "gzip",
+  "uncompressed_bytes": 10062725,
+  "benchmark_count": 163,
+  "cache_ttl_seconds": 18000
+}
