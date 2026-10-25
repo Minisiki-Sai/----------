@@ -10,6 +10,10 @@ frontend/node_modules/
 frontend/dist/
 frontend/src-tauri/target/
 frontend/src-tauri/gen/
+# 构建验证用的临时产物目录（vite --outDir dist-verify），一次几十兆、
+# 几百个文件，绝不能进仓库。
+frontend/dist-verify/
+frontend/dist-*/
 
 # Local verification artifacts
 v410_backend_test.log*
