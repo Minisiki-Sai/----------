@@ -29,17 +29,28 @@ export class ClassicMechanics {
   private dead = new Set<string>();
   private retired = new Set<string>();
   private seen = new Map<string,number>();
+  private templates=new Map<string,number>();
   private dragonSource = '';
   private trackingCancelled = false;
   private addsActive = false;
   private bombs = new Map<string,boolean>();
-  clear() {this.pending.clear();this.hp.clear();this.started.clear();this.dead.clear();this.retired.clear();this.seen.clear();this.dragonSource='';this.trackingCancelled=false;this.addsActive=false;this.bombs.clear();}
+  clear() {this.pending.clear();this.hp.clear();this.started.clear();this.dead.clear();this.retired.clear();this.seen.clear();this.dragonSource='';this.trackingCancelled=false;this.addsActive=false;this.bombs.clear();;this.templates.clear();}
   private cancel(source:string) {for(const [k,p] of this.pending) if(p.source===source)this.pending.delete(k);}
+  /** 换边后丢掉刚离开那一侧 Boss 的提醒（不标记已死：切回来仍会重新计时）。 */
+  forgetTemplates(templates:readonly number[]){
+    const set=new Set(templates.map(Number).filter(v=>v>0));
+    if(!set.size)return;
+    for(const [k,p] of [...this.pending]){
+      const t=this.templates.get(p.source);
+      if(t!==undefined&&set.has(t))this.pending.delete(k);
+    }
+  }
   private arm(source:string,key:string,text:string,stamp:number,delay:number) {this.pending.set(`${source}:${key}`,{source,deadline:stamp+delay*1000,notice:{key,text,mode:'warning'}});}
   private select(notices:Notice[],s:Settings) {return notices.filter(n=>s.enabled&&s.nests.includes('classic')&&s.skills.includes(n.key)&&(n.mode==='release'?s.releaseSkills:s.warningSkills).includes(n.key)).map(n=>n.text);}
   observe(e:ClassicEvent,nest:string,s:Settings,seed=false):string[] {
     if(!isClassic(nest)) {this.clear();return [];}
     const t=e.templateId||0, src=e.source, now=e.timestamp, notices:Notice[]=[];
+    if(t)this.templates.set(src,t);
     if(this.retired.has(src))return [];
     const say=(key:string,text:string,mode:Notice['mode']='warning')=>notices.push({key,text,mode});
     if(e.hpPercent===0) {this.dead.add(src);this.cancel(src);if(dragon.includes(t)){this.addsActive=false;this.bombs.clear();}return [];}

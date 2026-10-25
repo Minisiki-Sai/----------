@@ -1,8 +1,8 @@
 export const QWEN_VOICES = [
+  { key: 'Vivi2', label: 'Vivi2.0 · 清脆女声' },
+  { key: 'Xiaohe', label: '小何2.0 · 清晰女声' },
   { key: 'Vivian', label: 'Vivian · 明亮女声' },
   { key: 'Serena', label: 'Serena · 温柔女声' },
-  { key: 'Uncle_Fu', label: 'Uncle_Fu · 沉稳男声' },
-  { key: 'Dylan', label: 'Dylan · 青年男声' },
 ] as const;
 export function qwenVoiceKey(value: string): string {
   return QWEN_VOICES.some(v => v.key === value) ? value : 'Vivian';

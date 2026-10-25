@@ -123,9 +123,15 @@ class LiveDpsCollector:
         ] = (),
         prebattle_state: dict[str, object] | None = None,
         prebattle_tracker: object = None,
+        toggles: object = None,
+        seed_monster_entities: dict[int, int] | None = None,
     ) -> None:
         self.stop()
         self.aggregator.reset()
+        # The capture controller hands the current 采集内容开关 to a live start
+        # so a freshly started stream never replays events the user disabled.
+        if toggles is not None:
+            self.toggles = toggles
         self.source = V576NpcapSource(
             udp_ports,
             self.profile_path.parents[1],
@@ -140,6 +146,11 @@ class LiveDpsCollector:
             prebattle_state=prebattle_state,
             prebattle_tracker=prebattle_tracker,
             toggles=self.toggles,
+            # 伤害事件不进聚合器（不做 DPS），但攻击目标要单独记账：
+            # 分边副本靠它判断「我在打哪只 Boss」。
+            attack_target_sink=self.aggregator.observe_attack_target,
+            # 待机实体探针的 Boss 档案：进本后才开统计时靠它认出 Boss。
+            seed_monster_entities=seed_monster_entities,
         )
         self.history.start_session("npcap")
         self.status = "Npcap 实时统计中"

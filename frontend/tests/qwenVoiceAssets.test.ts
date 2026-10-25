@@ -61,6 +61,6 @@ test('all speakers contain real PCM audio for every announcement, not renamed du
       assert.ok(bytes.length > 12000, 'nonempty speech audio');
       return createHash('sha256').update(bytes).digest('hex');
     });
-    assert.equal(new Set(hashes).size, 4, 'each speaker must have its own synthesis');
+    assert.equal(new Set(hashes).size, QWEN_VOICES.length, 'each speaker must have its own synthesis');
   }
 });

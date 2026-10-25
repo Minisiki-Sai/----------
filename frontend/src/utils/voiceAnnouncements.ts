@@ -88,6 +88,11 @@ export function classicAddAnnouncement(kind: string | undefined, template: numbe
   return settings.skills.includes(key) && modes.includes(key) ? text : '';
 }
 
+// 空中的海龙是特例：梦魇海龙里它飞在天上，玩家打不到它，所以
+// 「当前攻击目标 / 悬浮窗 Boss 行」指向的都是地面的地狱犬卡卡里。
+// 冰眼与龙息因此**只能按技能号匹配**（见 SEA_MECHANICS 与 voiceRule），
+// 不能加「技能来源必须是当前 Boss / 当前目标」这类过滤，否则整段地狱犬
+// 阶段的播报和倒计时会一起消失。回归用例：tests/seaSkyBossAnnounce.test.ts。
 // All countdowns start at action-backed releases, never late hits or statuses.
 const BOSS_SKILLS: Record<number, number[]> = {
   4235448: [50318,50317,50311,50313,325423],
@@ -113,6 +118,22 @@ export class SeaReminderClock {
   private healthBySource = new Map<string, { template: number; percent: number }>();
   clear() { this.pending.clear(); this.dead.clear(); this.healthBySource.clear(); this.templates.clear(); }
   isDead(source: string) { return this.dead.has(source); }
+  /** 忘掉这些来源的全部倒计时（Boss 已离场）。`markDead` 后不再重新计时。 */
+  forgetSources(sources: readonly string[], markDead = false) {
+    const set = new Set(sources.map(String).filter(Boolean));
+    if (!set.size) return;
+    for (const [key, row] of [...this.pending]) if (set.has(row.source)) this.pending.delete(key);
+    if (markDead) for (const source of set) this.dead.add(source);
+  }
+  /** 换边后丢掉「刚离开那一侧」的倒计时，否则它会一直倒数/提示到冷却结束。 */
+  forgetTemplates(templates: readonly number[]) {
+    const set = new Set(templates.map(Number).filter(value => value > 0));
+    if (!set.size) return;
+    for (const [key, row] of [...this.pending]) {
+      const template = this.templates.get(row.source);
+      if (template !== undefined && set.has(template)) this.pending.delete(key);
+    }
+  }
   private delay(skill: number, source: string) {
     const hp = this.healthBySource.get(source);
     if (this.timing === 'cooldown') {
@@ -226,6 +247,9 @@ export function normalizeVoiceSettings(raw: any = {}) {
     clawMerged: true,
     bombMerged: true,
     enabled: raw.enabled === true,
+    // 分边副本（黑龙硬核／沙龙硬核）默认只播报自己正在打的那只 Boss；
+    // 与「悬浮窗倒计时」的同名开关相互独立。
+    splitBossOnly: raw.splitBossOnly !== false,
     volume: Number.isFinite(raw.volume) ? Math.max(0, Math.min(1, raw.volume)) : 0.8,
     voice: typeof raw.voice === 'string' ? raw.voice : '',
     nests: Array.isArray(raw.nests) ? raw.nests.filter((x: string) => ['classic', 'hard', 'sand-hard', 'sea-nightmare'].includes(x)) : ['classic', 'hard', 'sand-hard', 'sea-nightmare'],

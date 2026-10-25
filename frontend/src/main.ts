@@ -39,3 +39,5 @@ if (tauriAvailable) {
 }
 
 createApp(App).mount("#app");
+
+

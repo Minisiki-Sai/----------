@@ -1405,6 +1405,18 @@ export interface LiveTimelineStatus {
 
 export interface BuffOverlayStatus {
   endedBossIds?: string[];
+  /** 悬浮窗前两行的身份信息：副本名与当前 Boss 名，只用于展示。 */
+  /** 当前场景名：可能是副本，也可能是城镇/庭院。抓到了就不该显示未识别。 */
+  sceneName?: string;
+  /** nest / hub / map / unknown，决定第一行前缀与后缀。 */
+  sceneKind?: string;
+  nestName?: string;
+  nestLabel?: string;
+  nestKey?: string;
+  nestConfidence?: string;
+  bossName?: string;
+  bossTemplateId?: number;
+  bossTargetId?: string;
   bossHealth?: Array<{ instanceId: string; targetId: string; partId?: number; name: string; percent: number | null;
     currentHp: number | null; maxHp: number | null; confidence: string; updatedSeconds: number }>;
   selfAttackTarget?: { targetId: string; timestampMs: number } | null;
@@ -1538,6 +1550,8 @@ export interface BuffOverlaySettings {
   showDebuffOverlay: boolean;
   showSkillCountdownOverlay: boolean;
   selectedSkillCountdowns: string[];
+  /** 分边副本（黑龙硬核／沙龙硬核）只显示本机正在打的那只 Boss 的倒计时。 */
+  splitBossOnlyCurrent: boolean;
   showDamage: boolean;
   showResistance: boolean;
   showCritical: boolean;

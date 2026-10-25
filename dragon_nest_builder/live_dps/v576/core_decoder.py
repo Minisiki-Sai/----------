@@ -6,6 +6,7 @@ from math import isfinite
 from types import SimpleNamespace
 
 from ..dungeon_map_catalog import is_battle_map, resolve_dungeon_map_id
+from ..nest_probe import classic_nest_hint, get_probe
 from ..boss_hp import load_fixed_boss_hp_profiles, normalize_boss_hp_name
 from ..damage_object_origins import (
     DAMAGE_OBJECT_PROJECTILE_TEMPLATE_IDS,
@@ -210,6 +211,18 @@ class V576DecoderCoreMixin:
         self.action_parser_mode = (
             requested_mode if requested_mode in {"legacy", "structured"} else "structured"
         )
+        # 观测日志：默认关闭（DRAGON_NEST_NEST_PROBE=1 才记录），未开启时是空操作。
+        # 它只写事实，不参与任何判定，见 dragon_nest_builder/live_dps/nest_probe.py。
+        probe_root = data_root.resolve()
+        if len(probe_root.parents) > 1:
+            probe_root = probe_root.parents[1]
+        self.probe = get_probe(
+            probe_root,
+            header={
+                "dataRoot": str(data_root.resolve()),
+                "actionParserMode": self.action_parser_mode,
+            },
+        )
         self.structured_action_candidates = 0
         self.structured_action_emitted = 0
         self.structured_action_rejected = 0
@@ -259,6 +272,14 @@ class V576DecoderCoreMixin:
             for value in (name, *aliases)
         )
         self.boss_actor_ids: set[int] = set()
+        # 被「事件生成门」丢掉的 Boss 技能，按原因计数。
+        #
+        # 这类丢弃以前全是裸 ``continue``，抓包回放只能看到「没产出」，看不到
+        # 「解出来了但被谁吃掉」。红龙佩达 P1/P2 那场事故就是这么藏了三周：
+        # 34848 解出 4 条、发布 0 条，而日志里一片安静。
+        # 回放测试靠 ``skill_drop_counts`` 做守恒断言：必须为空。
+        self.skill_drop_counts: dict[str, int] = {}
+        self.skill_drop_samples: list[dict[str, object]] = []
         self.boss_action_catalog = _load_boss_action_catalog(
             str(data_root.resolve())
         )
@@ -877,6 +898,45 @@ class V576DecoderCoreMixin:
         self._prebattle_inherited_events.clear()
         return events
 
+    def seed_monster_entities(self, seeds: dict[int, int] | None) -> int:
+        """把待机探针/技能号反查到的 Boss 实体档案注入本解码器。
+
+        进本后才点开始统计时，Boss 的出场包已经过去；没有这张表，血量包和
+        技能包都会因为「不认识这个 actor」被丢掉，表现为悬浮窗「未识别」、
+        语音/倒计时全空。返回成功注入的条数。
+
+        「是不是 Boss」不只看模板自带的 ``boss`` 标记：沙龙的「流沙之下的沙虫」
+        (4150051) 这类关卡 Boss 在模板表里是 ``boss=False``，但在
+        ``boss_hp_profiles_v576.json`` 的副本 Boss 模板集合里。两处任一命中就算
+        Boss，否则注入之后技能包仍会被 ``boss_actor_ids`` 过滤掉。
+        """
+
+        if not isinstance(seeds, dict):
+            return 0
+        try:
+            from dragon_nest_builder.native.nest_inference import (
+                template_nest_index,
+            )
+
+            nest_templates = template_nest_index()
+        except Exception:
+            nest_templates = {}
+        applied = 0
+        for raw_actor, raw_template in seeds.items():
+            try:
+                actor_id = int(raw_actor)
+                template_id = int(raw_template)
+            except (TypeError, ValueError):
+                continue
+            template = self.monster_templates.get(template_id)
+            if template is None:
+                continue
+            self.monster_entities[actor_id] = template
+            if getattr(template, "boss", False) or template_id in nest_templates:
+                self.boss_actor_ids.add(actor_id)
+            applied += 1
+        return applied
+
     def seed_capture_boundary_evidence(
         self,
         evidence: dict[str, object] | None,
@@ -1053,10 +1113,26 @@ class V576DecoderCoreMixin:
             connection_context=packet,
         )
         if decoded is None:
+            self.probe.note_map_attempt(
+                hit=False,
+                length=len(packet.payload),
+                transport=packet.transport,
+                direction=packet.inferred_direction(),
+            )
             return
         origin = self.first_timestamp or packet.timestamp_seconds
         observed_at = max(0.0, packet.timestamp_seconds - origin)
         entry = resolve_dungeon_map_id(decoded.map_id)
+        self.probe.note_map_attempt(
+            hit=True,
+            map_id=int(decoded.map_id),
+            layout=str(getattr(decoded, "layout", "")),
+            active=bool(getattr(decoded, "active", False)),
+            authoritative=bool(getattr(decoded, "authoritative", True)),
+            known=entry is not None and bool(entry.display_name),
+            name=(entry.display_name if entry is not None else ""),
+            battle=bool(entry is not None and is_battle_map(entry)),
+        )
         if not bool(getattr(decoded, "authoritative", True)):
             self.detected_map_candidate_id = int(decoded.map_id)
             self.detected_map_candidate_name = (
@@ -1190,6 +1266,15 @@ class V576DecoderCoreMixin:
         self.detected_nest_observed_at = max(
             0.0,
             float(identity_row.get("observed_at") or 0.0),
+        )
+        self.probe.record(
+            "nest_identity",
+            route="map",
+            map_id=int(decoded.map_id),
+            root_id=int(root_id),
+            nest_key=self.detected_nest_key,
+            nest_name=self.detected_nest_name,
+            classic_regex_match=bool(classic_nest_hint(self.detected_nest_name)),
         )
 
     def _observe_town_scene_load(self, packet: PacketRecord) -> None:
@@ -1388,12 +1473,22 @@ class V576DecoderCoreMixin:
         corrected_target_was_known = False
         if self.first_timestamp is None:
             self.first_timestamp = packet.timestamp_seconds
+        packet_direction = packet.inferred_direction()
+        self.probe.observe_packet(packet.transport, packet_direction, packet.payload)
         monster_spawn = decode_v576_monster_spawn(
             packet.payload,
-            packet.inferred_direction(),
+            packet_direction,
             # A structurally valid unknown template still invalidates the old
             # lifetime. Catalog completeness must not decide entity reuse.
             None,
+        )
+        self.probe.note_spawn_attempt(
+            hit=monster_spawn is not None,
+            length=len(packet.payload),
+            transport=packet.transport,
+            direction=packet_direction,
+            actor=(f"0x{monster_spawn.actor_id:08X}" if monster_spawn else ""),
+            template_id=(monster_spawn.template_id if monster_spawn else 0),
         )
         if monster_spawn is not None:
             # Creation evidence, independent of damage and Boss classification.
@@ -1423,6 +1518,14 @@ class V576DecoderCoreMixin:
                     light_resistance=0, dark_resistance=0, actor_table_id=0,
                     boss=False,
                 )
+            self.probe.record(
+                "spawn_template",
+                actor=f"0x{monster_spawn.actor_id:08X}",
+                template_id=monster_spawn.template_id,
+                known=monster_spawn.template_id in self.monster_templates,
+                boss=bool(getattr(template, "boss", False)),
+                name=str(getattr(template, "name", ""))[:40],
+            )
             if template is not None and (
                 template.boss or self.entity_owner_evidence.observe_birth(
                     monster_spawn.actor_id, monster_spawn.template_id,
@@ -1463,25 +1566,45 @@ class V576DecoderCoreMixin:
                         self.detected_nest_observed_at = max(
                             0.0, packet.timestamp_seconds - origin
                         )
+                        self.probe.record(
+                            "nest_identity",
+                            route="template",
+                            template_id=int(monster_spawn.template_id),
+                            nest_key=self.detected_nest_key,
+                            nest_name=self.detected_nest_name,
+                            classic_regex_match=bool(
+                                classic_nest_hint(self.detected_nest_name)
+                            ),
+                        )
                 # Actor IDs are reused between stage transitions. Assignment,
                 # rather than setdefault, keeps replay and live capture correct.
                 phase_name = normalize_boss_hp_name(template.name)
-                if (
-                    (template.boss or phase_name in self._fixed_boss_phase_names)
-                    and phase_name != self._boss_phase_name
-                ):
+                # 阶段体（红龙佩达 503681/503682）在客户端怪物表里没标 boss，
+                # 只靠 table 标记会把这些 actor 从 boss_actor_ids 里剔掉，
+                # 于是它们的状态包整段不解析 —— 表现就是「进本后一条机制提示都没有」。
+                # 固定血量档案里登记过的 Boss 名字同样算数（这个集合本来只用于
+                # 阶段计数，是个遗漏）。
+                is_boss = bool(template.boss) or phase_name in self._fixed_boss_phase_names
+                if is_boss and phase_name != self._boss_phase_name:
                     self._boss_phase_serial += 1
                     self._boss_phase_name = phase_name
                 self.monster_entities[monster_spawn.actor_id] = template
                 self._monster_birth_phase[monster_spawn.actor_id] = (
                     self._boss_phase_serial
                 )
-                if template.boss:
+                if is_boss:
                     observe_scene_boss(self, packet)
-                if template.boss:
                     self.boss_actor_ids.add(monster_spawn.actor_id)
                 else:
                     self.boss_actor_ids.discard(monster_spawn.actor_id)
+                self.probe.record(
+                    "boss_bind",
+                    actor=f"0x{monster_spawn.actor_id:08X}",
+                    template_id=monster_spawn.template_id,
+                    boss=is_boss,
+                    bossActorCount=len(self.boss_actor_ids),
+                    phase=self._boss_phase_name,
+                )
                 self.skill_actor_ids.discard(monster_spawn.actor_id)
                 self.local_actor_ids.discard(monster_spawn.actor_id)
                 self.actor_jobs.pop(monster_spawn.actor_id, None)
@@ -1492,7 +1615,7 @@ class V576DecoderCoreMixin:
                 for object_key in tuple(self.recent_skill_object_owners):
                     if monster_spawn.actor_id in object_key:
                         self.recent_skill_object_owners.pop(object_key, None)
-                if template.boss:
+                if is_boss:
                     self.boss_actor_id = monster_spawn.actor_id
                     target_name, target_job = self._monster_display_context(
                         monster_spawn.actor_id
@@ -2982,6 +3105,9 @@ class V576DecoderCoreMixin:
         self._observe_lobby_return(packet)
         self._observe_scene_teardown(packet)
         self._observe_gateway_route_catalog(packet)
+        # 必须早于本包的 Boss 动作/血量解码：技能号反查出来的实体要能在同一个
+        # 包里立刻生效，否则中途开抓时第一波技能还是会被丢掉。
+        self._observe_skill_identity(packet, direction)
         settlement = (
             decode_settlement(packet, self.first_timestamp)
             if packet.transport.upper() == "TCP" and may_contain_settlement(packet.payload)

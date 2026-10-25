@@ -394,6 +394,29 @@ def _int_defaultdict() -> defaultdict[int, int]:
     return defaultdict(int)
 
 
+# 分边判断只看最近 10 秒还在攻击某只 Boss 的人。
+_ATTACK_PLAYER_WINDOW_MS = 10_000.0
+# 更短的「此刻还在打」窗口，专供分边过滤用：攻击有明显的节奏间隔，4 秒足够
+# 覆盖连续输出，又能把「AOE 偶尔蹭到对侧」排除掉。
+_SPLIT_ATTACK_WINDOW_MS = 4_000.0
+# 「我当前在打谁」的时效。``lastAttackTargets`` 是永久表（用于名字反查），
+# 不能直接当「当前目标」：Boss 离场/阶段结束后没人再碰它，这条记录会永远
+# 停在那里，于是悬浮窗 Boss 行、分边过滤都会跟着一个早就不在的 Boss 走
+# （实测梦魇海龙 P2：本机最后目标是已经在 725s 飞走的海龙 4237003，它还被
+# 当成「另一侧」把真正的冰眼/龙息过滤掉了）。15 秒覆盖跑位和读条间隔。
+_ATTACK_TARGET_TTL_MS = 15_000.0
+# 悬浮窗「Boss:」这一行的时效。比业务判定（15s）长一倍：播报必须立刻跟上换边，
+# 但显示层跟着换会闪；30 秒够覆盖读条、被控和一次跑机制，超过就按「未识别」留空，
+# 不回落队友目标（用户要求：不打怪时这一行只认自己打过的）。
+_DISPLAY_TARGET_TTL_MS = 30_000.0
+# 「我此刻主要在打谁」的加权窗口。分边/播报的白名单判定不能只看「最后命中的
+# 是谁」：AOE 扫过一群怪时，最后命中的那个单位常常是杂兵或对侧 Boss。按窗口
+# 内的伤害占比取最高者，才不会被一次溅射改掉主目标。
+_ATTACK_SCORE_WINDOW_MS = 15_000.0
+# 每个 (玩家, 目标) 按秒分桶，只留窗口内的桶；20 桶足够覆盖 15 秒 + 边界。
+_ATTACK_SCORE_MAX_BUCKETS = 20
+
+
 class CombatAggregator:
     def __init__(
         self,
@@ -419,6 +442,116 @@ class CombatAggregator:
         self._healing_attribution_ledger = HealingAttributionLedger()
         self.reset()
 
+    def observe_attack_target(
+        self,
+        source_id: str,
+        target_id: str,
+        timestamp_ms: float,
+        target_name: str = "",
+        amount: float = 0.0,
+    ) -> None:
+        """只记账：某玩家最后一次攻击的目标。
+
+        轻量版（倒计时工具）不把伤害事件交给聚合器，因此没有 DPS 统计；但
+        分边副本（黑龙硬核 / 沙龙硬核）要靠 ``lastAttackTargets[selfSourceId]``
+        判断「我在打朱武还是卡基夫」。这条旁路只维护一个 dict，不累计伤害、
+        不建曲线，成本可忽略。
+
+        ``amount`` 为这次命中的伤害量，用于「15 秒内主要目标」的加权占比
+        （见 ``_ATTACK_SCORE_WINDOW_MS``）。不回传时按 0 处理，此时主目标
+        退化回「最近一次命中」，与旧行为一致。
+
+        时间戳必须单调，迟到的包不能把目标改回去。
+        """
+
+        if not source_id or not target_id:
+            return
+        previous = self._overlay_last_attack_targets.get(source_id, {})
+        if timestamp_ms >= float(previous.get("timestampMs", -1)):
+            self._overlay_last_attack_targets[source_id] = {
+                "targetId": target_id,
+                "timestampMs": timestamp_ms,
+            }
+        if amount > 0:
+            self._score_attack_target(source_id, target_id, timestamp_ms, amount)
+        # 目标行的 first_ms/last_ms 只用于「谁最近在被打」的排序，不参与伤害
+        # 统计。不更新它的话，轻量版里这些时间全是 0，身份识别就只能回退到
+        # 「按 target_id 排序第一个」——Boss 行于是永远停在第一关。
+        bounds = self._overlay_target_bounds.setdefault(
+            target_id, [int(timestamp_ms), int(timestamp_ms)]
+        )
+        bounds[0] = min(bounds[0], int(timestamp_ms))
+        bounds[1] = max(bounds[1], int(timestamp_ms))
+
+        if target_name:
+            self._overlay_target_names[target_id] = str(target_name).strip()
+            if len(self._overlay_target_names) > 256:
+                self._overlay_target_names = dict(
+                    list(self._overlay_target_names.items())[-128:]
+                )
+
+        template = str(target_id).rsplit("@", 1)[-1].strip()
+        if template.isdigit():
+            players = self._overlay_attack_players.setdefault(template, {})
+            players[source_id] = float(timestamp_ms)
+            # 只保留窗口内的人：分边判断是「现在谁在打」，不是历史。
+            cutoff = float(timestamp_ms) - _ATTACK_PLAYER_WINDOW_MS
+            stale = [key for key, stamp in players.items() if stamp < cutoff]
+            for key in stale:
+                players.pop(key, None)
+            if len(self._overlay_attack_players) > 64:
+                self._overlay_attack_players = {
+                    key: value
+                    for key, value in self._overlay_attack_players.items()
+                    if any(stamp >= cutoff for stamp in value.values())
+                }
+
+    def _score_attack_target(
+        self,
+        source_id: str,
+        target_id: str,
+        timestamp_ms: float,
+        amount: float,
+    ) -> None:
+        """按 (玩家, 目标) 累计伤害，按秒分桶并裁掉窗口外的桶。
+
+        只服务「本机 15 秒内在主要打谁」这一个判断。用分桶而不是逐事件流水，
+        是因为一次团队副本里每秒可能有上百次命中，而这里只需要一个可比较的
+        权重；按秒合并后每个 (玩家, 目标) 最多 20 个数字。
+        """
+
+        second = int(timestamp_ms // 1000)
+        per_player = self._overlay_attack_scores.setdefault(source_id, {})
+        buckets = per_player.setdefault(target_id, {})
+        buckets[second] = buckets.get(second, 0.0) + float(amount)
+        if len(buckets) <= _ATTACK_SCORE_MAX_BUCKETS:
+            return
+        cutoff = second - int(_ATTACK_SCORE_WINDOW_MS // 1000)
+        for key in [key for key in buckets if key < cutoff]:
+            buckets.pop(key, None)
+
+    def attack_scores(self, timestamp_ms: float) -> dict[str, dict[str, float]]:
+        """窗口内每个玩家对每个目标的累计伤害（按玩家分组）。
+
+        供 ``focus hint`` 选「本机 15 秒内伤害占比最高的目标」。窗口按传入
+        的战斗时钟计算，不用墙钟，回放和实时走同一条路径。
+        """
+
+        floor = float(timestamp_ms) - _ATTACK_SCORE_WINDOW_MS
+        scores: dict[str, dict[str, float]] = {}
+        for source, targets in self._overlay_attack_scores.items():
+            rows: dict[str, float] = {}
+            for target, buckets in targets.items():
+                total = sum(
+                    value for second, value in buckets.items()
+                    if second * 1000.0 >= floor
+                )
+                if total > 0:
+                    rows[target] = round(total, 3)
+            if rows:
+                scores[source] = rows
+        return scores
+
     def reset(self) -> None:
         self._replay_snapshot = None
         # Keep this deliberately typed as object: the concrete live-event
@@ -442,6 +575,15 @@ class CombatAggregator:
         self._overlay_target_hits: Counter[str] = Counter()
         self._overlay_target_bounds: dict[str, list[int]] = {}
         self._overlay_last_attack_targets: dict[str, dict[str, object]] = {}
+        # 模板 -> {玩家: 最后一次打它的时间}。分边副本要靠「打 A 的人和打 B 的人
+        # 有没有重叠」来区分「左右两队各打一只」和「同一关两只都要打」。
+        self._overlay_attack_players: dict[str, dict[str, float]] = {}
+        # 玩家 -> 目标 -> 秒桶 -> 伤害。只用于「本机主要目标」的加权占比，
+        # 与 _overlay_target_damage（全团、全时段累计）刻意分开。
+        self._overlay_attack_scores: dict[str, dict[str, dict[int, float]]] = {}
+        # target_id -> 名字。轻量版没有血量行/伤害累计行，「Boss:」这一行的名字
+        # 只能从伤害事件里带出来（CombatEvent.target_name）。
+        self._overlay_target_names: dict[str, str] = {}
         self._boss_output_window_cache_signature: tuple[object, ...] = ()
         self._boss_output_window_cache: dict[
             tuple[str, str], tuple[tuple[int, int], ...]
@@ -2240,11 +2382,12 @@ class CombatAggregator:
             if event.target_id:
                 self._overlay_target_damage[event.target_id] += event.amount
                 if event.amount > 0:
-                    previous = self._overlay_last_attack_targets.get(event.source_id, {})
-                    if event.timestamp_ms >= float(previous.get("timestampMs", -1)):
-                        self._overlay_last_attack_targets[event.source_id] = {
-                            "targetId": event.target_id, "timestampMs": event.timestamp_ms,
-                        }
+                    self.observe_attack_target(
+                        event.source_id,
+                        event.target_id,
+                        event.timestamp_ms,
+                        amount=event.amount,
+                    )
                 self._overlay_target_hits[event.target_id] += 1
                 bounds = self._overlay_target_bounds.setdefault(
                     event.target_id,
@@ -4111,6 +4254,8 @@ class CombatAggregator:
             "_actor_context", "_party_members", "_overlay_target_damage",
             "_overlay_target_hits", "_target_max_hp", "_overlay_incoming_damage",
             "_overlay_latest_skill_casts", "_overlay_last_attack_targets",
+            "_overlay_attack_players", "_overlay_attack_scores",
+            "_overlay_target_names",
             "_damage_by_second",
         ):
             setattr(frozen, name, dict(getattr(self, name)))
@@ -4409,6 +4554,46 @@ class CombatAggregator:
                 for member in self._party_members.values()
             ],
             "lastAttackTargets": dict(self._overlay_last_attack_targets),
+            # 带时效的「当前目标」视图：只保留最近 15 秒真正打过的目标。
+            # 业务判定（Boss 行身份、分边分组、队友目标行）用这张表；
+            # 永久表 ``lastAttackTargets`` 只留作名字反查与历史诊断。
+            "recentAttackTargets": {
+                source: dict(entry)
+                for source, entry in self._overlay_last_attack_targets.items()
+                if isinstance(entry, dict)
+                and current_ms - float(entry.get("timestampMs") or 0)
+                <= _ATTACK_TARGET_TTL_MS
+            },
+            # 悬浮窗 Boss 行的「本机目标」视图：30 秒时效。停手超过 30 秒就不再
+            # 出现在这里，Boss 行据此留空，而不是跳到队友正在打的那只。
+            "displayAttackTargets": {
+                source: dict(entry)
+                for source, entry in self._overlay_last_attack_targets.items()
+                if isinstance(entry, dict)
+                and current_ms - float(entry.get("timestampMs") or 0)
+                <= _DISPLAY_TARGET_TTL_MS
+            },
+            "targetNames": dict(self._overlay_target_names),
+            "attackTargetsByTemplate": {
+                template: sorted(players)
+                for template, players in self._overlay_attack_players.items()
+                if players
+            },
+            # 短窗口版（4 秒）：分边判断要的是「此刻谁还在打」，不是「最近 10 秒
+            # 谁碰过」。梦魇海龙里 AOE 每 10 秒蹭到对侧一次，用 10 秒表会把
+            # 「我自己两边都打」误判成成立，从而完全放弃分边过滤。
+            "recentAttackers": {
+                template: sorted(
+                    player
+                    for player, stamp in players.items()
+                    if float(stamp) >= current_ms - _SPLIT_ATTACK_WINDOW_MS
+                )
+                for template, players in self._overlay_attack_players.items()
+                if players
+            },
+            # 「本机 15 秒内主要在打谁」的加权表：玩家 -> 目标 -> 窗口内伤害。
+            # 播报白名单（focus）用它选主目标，避免 AOE 溅射一命中就换侧。
+            "attackScores": self.attack_scores(current_ms),
             "raw_healing_total": total_healing,
             "factual_healing_total": total_healing,
             "attributed_healing_total": total_healing,

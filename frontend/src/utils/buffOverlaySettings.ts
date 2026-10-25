@@ -1,5 +1,9 @@
 import type { BuffOverlaySettings } from "../types/api";
 import { SKILL_COUNTDOWN_OPTIONS } from './skillCountdowns.ts';
+import {
+  captureToggleAllows,
+  type CaptureToggleState,
+} from './captureToggles.ts';
 
 export const BUFF_OVERLAY_STORAGE_KEY = "dragon-nest-v420-buff-overlay-settings";
 
@@ -12,10 +16,28 @@ export const BUFF_OVERLAY_CATALOG_STORAGE_KEY = "dragon-nest-v4521-overlay-catal
 
 export type OverlayWindowKind = keyof typeof OVERLAY_WINDOW_LABELS;
 
-export function enabledOverlayWindowLabels(settings: BuffOverlaySettings): string[] {
+/**
+ * 当前应该显示哪些悬浮窗。
+ *
+ * 两层门槛，缺一不可：
+ *   1. 首页「总开关」（buffers / boss_actions）——关掉即整类悬浮窗不显示，
+ *      但语音播报照旧，所以它只是显示开关，不是采集开关。
+ *   2. 悬浮窗设置里的分项（Buff 状态 / Debuff 状态 / Boss 技能倒计时）。
+ *
+ * `toggles` 省略时读 localStorage 缓存，方便窗口显隐、热键、发布器这些
+ * 没有网络上下文的调用点共用同一份判断。
+ */
+export function enabledOverlayWindowLabels(
+  settings: BuffOverlaySettings,
+  toggles?: CaptureToggleState,
+): string[] {
   const labels: string[] = [];
-  if (settings.showBuffOverlay || settings.showDebuffOverlay) labels.push(OVERLAY_WINDOW_LABELS.status);
-  if (settings.showSkillCountdownOverlay) labels.push(OVERLAY_WINDOW_LABELS.skill);
+  const statusEnabled = captureToggleAllows("buffs", toggles)
+    && (settings.showBuffOverlay || settings.showDebuffOverlay);
+  if (statusEnabled) labels.push(OVERLAY_WINDOW_LABELS.status);
+  const skillEnabled = captureToggleAllows("boss_actions", toggles)
+    && settings.showSkillCountdownOverlay;
+  if (skillEnabled) labels.push(OVERLAY_WINDOW_LABELS.skill);
   return labels;
 }
 
@@ -28,6 +50,8 @@ export const DEFAULT_BUFF_OVERLAY_SETTINGS: BuffOverlaySettings = {
   showBuffOverlay: true,
   showDebuffOverlay: true,
   showSkillCountdownOverlay: true,
+  // 分边副本默认只显示自己正在打的那只 Boss 的倒计时；关掉就两边都显示。
+  splitBossOnlyCurrent: true,
   selectedSkillCountdowns: SKILL_COUNTDOWN_OPTIONS.map(row => row.key),
   showDamage: true,
   showResistance: true,
@@ -126,6 +150,7 @@ export function normalizeBuffOverlaySettings(raw: Partial<BuffOverlaySettings> |
     showBuffOverlay: value.showBuffOverlay !== false,
     showDebuffOverlay: value.showDebuffOverlay !== false,
     showSkillCountdownOverlay: value.showSkillCountdownOverlay !== false,
+    splitBossOnlyCurrent: value.splitBossOnlyCurrent !== false,
     selectedSkillCountdowns: Array.isArray(value.selectedSkillCountdowns)
       ? uniqueStrings(value.selectedSkillCountdowns).filter(key => SKILL_COUNTDOWN_OPTIONS.some(row => row.key === key))
       : SKILL_COUNTDOWN_OPTIONS.map(row => row.key),

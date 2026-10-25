@@ -36,6 +36,10 @@ static SINGLE_INSTANCE_MUTEX_HANDLE: AtomicIsize = AtomicIsize::new(0);
 
 const TRAY_SHOW_MENU_ID: &str = "tray-show-main";
 const TRAY_EXIT_MENU_ID: &str = "tray-exit";
+// 游戏独占键盘时全局热键会被游戏吞掉（实测 ALT+F9/F11/F12 在游戏前台都收不到
+// WM_HOTKEY），托盘菜单是玩家在游戏窗口化时唯一稳定的入口。
+const TRAY_START_MENU_ID: &str = "tray-start-capture";
+const TRAY_STOP_MENU_ID: &str = "tray-stop-capture";
 const MINIMIZE_TO_TRAY_FILE_NAME: &str = "minimize-to-tray.txt";
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -1303,6 +1307,24 @@ fn pick_npcap_folder() -> Option<String> {
 }
 
 #[tauri::command]
+fn pick_record_folder(current: Option<String>) -> Option<String> {
+    let mut dialog = rfd::FileDialog::new().set_title("选择调试记录保存目录");
+    if let Some(seed) = current
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+    {
+        if seed.is_dir() {
+            dialog = dialog.set_directory(seed);
+        }
+    }
+    dialog
+        .pick_folder()
+        .map(|path| path.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
 async fn set_buff_overlay_visible(
     app: tauri::AppHandle,
     visible: bool,
@@ -1784,7 +1806,27 @@ fn create_backend_kill_job(child: &Child) -> Option<isize> {
     }
 }
 
+/// A development launcher may own the Python backend itself (file watching,
+/// log tee, restart).  Spawning it here would first kill that process through
+/// `stop_stale_dev_backend` and then fight the launcher's watcher.
+#[cfg(all(windows, debug_assertions))]
+fn external_dev_backend_requested() -> bool {
+    matches!(
+        std::env::var("DRAGON_NEST_DEV_EXTERNAL_BACKEND").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE")
+    )
+}
+
+#[cfg(not(all(windows, debug_assertions)))]
+fn external_dev_backend_requested() -> bool {
+    false
+}
+
 fn start_backend(root: &Path) -> Option<BackendChild> {
+    if cfg!(debug_assertions) && external_dev_backend_requested() {
+        append_app_diagnostic("dev-external-backend", "spawn_skipped=true");
+        return None;
+    }
     let bundled = if cfg!(debug_assertions) {
         root.join("runtime/DragonNestEngine/DragonNestEngine.exe")
     } else {
@@ -1990,6 +2032,17 @@ pub fn run() {
                 .unwrap_or_default(),
         ),
     );
+    // Start the capture engine before the WebView is created. WebView2 needs a
+    // couple of seconds to bring up its first window; the engine's own ~1.5 s
+    // boot should overlap with that instead of starting afterwards.
+    let prelaunched = if cfg!(debug_assertions) {
+        None
+    } else {
+        std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|dir| dir.to_path_buf()))
+            .and_then(|root| start_backend(&root))
+    };
     match crash_diagnostics::initialize_session(APP_VERSION, app_diagnostic_path()) {
         Ok(true) => append_app_diagnostic(
             "previous-unclean-exit-detected",
@@ -2047,6 +2100,7 @@ pub fn run() {
             install_npcap,
             pick_npcap_path,
             pick_npcap_folder,
+            pick_record_folder,
             set_buff_overlay_visible,
             set_buff_overlay_window_visible,
             begin_buff_overlay_drag,
@@ -2065,10 +2119,23 @@ pub fn run() {
             set_minimize_to_tray,
             finish_exit_after_build_save
         ])
-        .setup(|app| {
+        .setup(move |app| {
             // WebView2 and other native libraries may install their own exception
             // filter during startup. Re-register ours after window initialization.
             install_native_exception_diagnostics();
+            // Launch the capture engine before any other setup work. The frozen
+            // engine needs about 1.5 s to bind its port; starting it here lets
+            // that overlap with WebView2, menu and tray initialisation instead
+            // of pushing the window's first usable second out by several
+            // seconds.
+            let root = if cfg!(debug_assertions) {
+                project_root()
+            } else {
+                app.path().resource_dir()?
+            };
+            app.manage(BackendProcess(Mutex::new(
+                prelaunched.or_else(|| start_backend(&root)),
+            )));
             start_foreground_game_hotkey_poller(app.handle().clone());
             let mut native_windows = HashMap::new();
             for label in NATIVE_WINDOW_LABELS {
@@ -2092,8 +2159,25 @@ pub fn run() {
 
             let show_item =
                 MenuItem::with_id(app, TRAY_SHOW_MENU_ID, "显示主窗口", true, None::<&str>)?;
+            let start_item = MenuItem::with_id(
+                app,
+                TRAY_START_MENU_ID,
+                "一键开始（统计 + 悬浮窗）",
+                true,
+                None::<&str>,
+            )?;
+            let stop_item = MenuItem::with_id(
+                app,
+                TRAY_STOP_MENU_ID,
+                "一键结束（停统计 + 关悬浮窗）",
+                true,
+                None::<&str>,
+            )?;
             let exit_item = MenuItem::with_id(app, TRAY_EXIT_MENU_ID, "退出", true, None::<&str>)?;
-            let tray_menu = Menu::with_items(app, &[&show_item, &exit_item])?;
+            let tray_menu = Menu::with_items(
+                app,
+                &[&start_item, &stop_item, &show_item, &exit_item],
+            )?;
             let mut tray_builder = TrayIconBuilder::with_id("dragon-nest-act-tray")
                 .menu(&tray_menu)
                 .show_menu_on_left_click(false)
@@ -2106,6 +2190,11 @@ pub fn run() {
                         if let Err(error) = show_main_window(app) {
                             append_app_diagnostic("tray-show-main-error", &error);
                         }
+                    } else if event.id() == TRAY_START_MENU_ID {
+                        dispatch_global_hotkey_action(app, "start-capture".to_string());
+                    } else if event.id() == TRAY_STOP_MENU_ID {
+                        // 前端把 toggle-overlay 固定解释为「一键结束」。
+                        dispatch_global_hotkey_action(app, "toggle-overlay".to_string());
                     } else if event.id() == TRAY_EXIT_MENU_ID {
                         request_graceful_exit(app, "source=tray-menu");
                     }
@@ -2133,12 +2222,6 @@ pub fn run() {
             }
             tray_builder.build(app)?;
 
-            let root = if cfg!(debug_assertions) {
-                project_root()
-            } else {
-                app.path().resource_dir()?
-            };
-            app.manage(BackendProcess(Mutex::new(start_backend(&root))));
             let diagnostic_root = root.clone();
             let diagnostic_handle = app.handle().clone();
             std::thread::spawn(move || {

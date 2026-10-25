@@ -19,18 +19,29 @@ const apostles=[4181005,4181006,4181007,4181008];
 
 export class HardMechanics {
   private pending=new Map<string,{source:string;deadline:number;notice:Notice}>();
+  private templates=new Map<string,number>();
   private seen=new Map<string,number>();
   private dead=new Set<string>();
   private retired=new Set<string>();
   private entered=new Set<string>();
   private dragonSource='';
-  clear(){this.pending.clear();this.seen.clear();this.dead.clear();this.retired.clear();this.entered.clear();this.dragonSource='';}
+  clear(){this.pending.clear();this.seen.clear();this.dead.clear();this.retired.clear();this.entered.clear();this.dragonSource='';;this.templates.clear();}
   private cancel(src:string){for(const [k,p] of this.pending)if(p.source===src)this.pending.delete(k);}
+  /** 换边后丢掉刚离开那一侧 Boss 的提醒（不标记已死：切回来仍会重新计时）。 */
+  forgetTemplates(templates:readonly number[]){
+    const set=new Set(templates.map(Number).filter(v=>v>0));
+    if(!set.size)return;
+    for(const [k,p] of [...this.pending]){
+      const t=this.templates.get(p.source);
+      if(t!==undefined&&set.has(t))this.pending.delete(k);
+    }
+  }
   private arm(src:string,key:string,text:string,now:number,delay:number){this.pending.set(`${src}:${key}`,{source:src,deadline:now+delay*1000,notice:{key,text,mode:'warning'}});}
   private select(rows:Notice[],s:Settings){return rows.filter(n=>s.enabled&&s.nests.includes('hard')&&s.skills.includes(n.key)&&(n.mode==='release'?s.releaseSkills:s.warningSkills).includes(n.key)).map(n=>n.text);}
   observe(e:ClassicEvent,nest:string,s:Settings,seed=false):string[]{
     if(!nest.includes('黑龙')||!nest.includes('硬核')){this.clear();return [];}
     const t=e.templateId||0,src=e.source,now=e.timestamp,rows:Notice[]=[];
+    if(t)this.templates.set(src,t);
     if(e.hpPercent===0){this.dead.add(src);this.cancel(src);return [];}
     if(this.dead.has(src)||this.retired.has(src))return [];
     const action=e.skill>0&&e.kind!=='boss_hp_threshold'&&e.confirmedEndTimestamp===undefined&&!e.recipients?.length;

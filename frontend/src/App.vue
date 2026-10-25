@@ -2,12 +2,14 @@
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { AlertTriangle, Database, LoaderCircle, Moon, Sun } from "@lucide/vue";
+import { Activity, AlertTriangle, LoaderCircle, Moon, Settings2, Sun } from "@lucide/vue";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import LiveDpsView from "./views/LiveDpsView.vue";
 import SettingsView from "./views/SettingsView.vue";
+import ReplayView from "./views/ReplayView.vue";
 import BuffOverlay from "./components/BuffOverlay.vue";
 import { simulatorApi } from "./services/api";
+import { replayActive, stopReplay } from "./services/replaySource";
 import { APP_NAME, APP_SHORT_NAME, APP_VERSION_LABEL } from "./appVersion";
 import { readGlobalHotkeyConfiguration } from "./utils/globalHotkeys";
 import {
@@ -46,7 +48,7 @@ watch(theme, value => {
   localStorage.setItem(THEME_STORAGE_KEY, value);
 }, { immediate: true });
 
-const page = ref<"control" | "npcap">("control");
+const page = ref<"control" | "npcap" | "replay">("control");
 const connected = ref(false);
 const busy = ref(true);
 const error = ref("");
@@ -81,43 +83,68 @@ function toggleTheme() {
   theme.value = theme.value === "dark" ? "light" : "dark";
 }
 
-async function keepOverlaysInSync() {
+const OVERLAY_ENABLED_KEY = "dragon-nest-v420-buff-overlay-enabled";
+
+async function setOverlayVisible(visible: boolean) {
+  localStorage.setItem(OVERLAY_ENABLED_KEY, visible ? "1" : "0");
   if (!tauriAvailable || isOverlayWindow) return;
-  if (localStorage.getItem("dragon-nest-v420-buff-overlay-enabled") !== "1") return;
   try {
     await invoke("set_buff_overlay_visible", {
-      visible: true,
+      visible,
       overlayLabels: enabledOverlayWindowLabels(readBuffOverlaySettings()),
     });
   } catch {
-    // The overlay windows are re-created on the next capture start.
+    // 悬浮窗窗口会在下一次抓包开始时重建，这里失败不影响统计本身。
+  }
+}
+
+/**
+ * 一键开始：统计 + 悬浮窗，两个一起开。
+ *
+ * 以前这里只有「开始统计」，悬浮窗要不要显示取决于上一次按 F11 的切换结果，
+ * 所以经常出现「统计开了但看不到悬浮窗」。现在按一下就是完整的可战斗状态。
+ */
+async function startCaptureWithOverlay() {
+  // 回放会接管 status/voice-events 两个接口。这里不先退出回放的话，
+  // 真实统计其实已经在抓包，界面却一直显示回放内容 —— 看着像统计坏了。
+  if (replayActive()) stopReplay();
+  const current = await simulatorApi.captureStatus(false);
+  if (!["starting", "running"].includes(current.state)) {
+    await simulatorApi.startCapture(0);
+  }
+  await setOverlayVisible(true);
+}
+
+/**
+ * 一键结束：停统计 + 关悬浮窗。
+ *
+ * 原先是「切换悬浮窗」，同一个键既可能开也可能关，取决于 localStorage 里上一次
+ * 的状态；游戏里按一下没反应（其实是关掉了）的困惑就是这么来的。现在语义固定：
+ * 这个键只负责关。
+ */
+async function stopCaptureWithOverlay() {
+  // 回放中按「一键结束」要连回放一起停，否则窗口关了语音还在念。
+  if (replayActive()) stopReplay();
+  // 先关窗再停统计：反过来的话，统计停下时悬浮窗会先闪一遍「已好」。
+  await setOverlayVisible(false);
+  const current = await simulatorApi.captureStatus(false);
+  if (["starting", "running"].includes(current.state)) {
+    await simulatorApi.stopCapture();
   }
 }
 
 async function handleHotkey(action: string) {
   if (overlaySessionEnding()) return;
   if (action === "start-capture") {
-    const current = await simulatorApi.captureStatus(false);
-    if (!["starting", "running"].includes(current.state)) {
-      await simulatorApi.startCapture(0);
-      localStorage.setItem("dragon-nest-v420-buff-overlay-enabled", "1");
-      await keepOverlaysInSync();
-    }
+    await startCaptureWithOverlay();
     window.dispatchEvent(new CustomEvent("dragon-nest-live-hotkey-state", { detail: { action: "start-capture" } }));
     return;
   }
-  if (action !== "toggle-overlay") return;
-  const visible = localStorage.getItem("dragon-nest-v420-buff-overlay-enabled") !== "1";
-  if (visible) {
-    const current = await simulatorApi.captureStatus(false);
-    if (!["starting", "running"].includes(current.state)) await simulatorApi.startCapture(0);
+  // 原生层仍叫 toggle-overlay（改名要动 Rust），但语义已固定为「一键结束」。
+  if (action === "toggle-overlay") {
+    await stopCaptureWithOverlay();
+    window.dispatchEvent(new CustomEvent("dragon-nest-live-hotkey-state", { detail: { action: "stop-capture" } }));
   }
-  localStorage.setItem("dragon-nest-v420-buff-overlay-enabled", visible ? "1" : "0");
-  await invoke("set_buff_overlay_visible", {
-    visible,
-    overlayLabels: enabledOverlayWindowLabels(readBuffOverlaySettings()),
-  });
-  window.dispatchEvent(new CustomEvent("dragon-nest-live-hotkey-state", { detail: { action: "toggle-overlay", visible } }));
 }
 
 onMounted(async () => {
@@ -166,19 +193,19 @@ onUnmounted(() => {
       <button class="frost-traffic is-max" type="button" title="最大化" @click="toggleMaximize" />
     </div>
     <main class="frost-panel">
-      <template v-if="!connected">
-        <div class="frost-boot">
-          <LoaderCircle v-if="busy" :size="30" class="frost-spin" />
-          <AlertTriangle v-else :size="30" />
-          <h1>{{ busy ? "正在唤醒解析核心" : "解析核心未响应" }}</h1>
-          <p>{{ busy ? "正在连接本机抓包解析服务，通常只需几秒。" : (error || `请确认 ${APP_VERSION_LABEL} 后端已启动后重试。`) }}</p>
-          <button v-if="!busy" class="frost-pill" @click="connect()">重新连接</button>
-        </div>
-      </template>
-      <template v-else>
-        <KeepAlive><LiveDpsView v-if="page === 'control'" @open-npcap="page = 'npcap'" /></KeepAlive>
-        <KeepAlive><SettingsView v-if="page === 'npcap'" @back="page = 'control'" /></KeepAlive>
-      </template>
+      <!-- The window paints the real panel immediately. Waiting behind a
+           splash until the capture engine finished loading made the first few
+           seconds of every launch feel frozen: the controls were already on
+           screen but could not be clicked. -->
+      <KeepAlive><LiveDpsView v-if="page === 'control'" @open-npcap="page = 'npcap'" /></KeepAlive>
+      <KeepAlive><SettingsView v-if="page === 'npcap'" @back="page = 'control'" @open-replay="page = 'replay'" /></KeepAlive>
+      <KeepAlive><ReplayView v-if="page === 'replay'" :tauri-available="tauriAvailable" @back="page = 'npcap'" /></KeepAlive>
+      <div v-if="!connected" class="frost-note is-warm" role="status" style="margin-top: 12px">
+        <LoaderCircle v-if="busy" :size="15" class="frost-spin" />
+        <AlertTriangle v-else :size="15" />
+        <span>{{ busy ? "正在唤醒解析核心，界面已可用…" : (error || "解析核心未响应，点此重试。") }}</span>
+        <button v-if="!busy" class="frost-link" type="button" @click="connect()">重新连接</button>
+      </div>
       <div v-if="error && connected" class="frost-note is-error" role="alert" style="margin-top: 12px">
         <AlertTriangle :size="15" />{{ error }}
       </div>
@@ -193,16 +220,27 @@ onUnmounted(() => {
         </span>
       </button>
 
-      <p class="frost-rail-caption">设置</p>
-      <nav class="frost-rail-nav" aria-label="设置导航">
+      <!-- 右侧栏常驻两个页面入口：从设置页回去不只有左上角那个返回箭头，
+           窗口被拖歪、或者滚动容器不听话时，这里也点得到。 -->
+      <p class="frost-rail-caption">页面</p>
+      <nav class="frost-rail-nav" aria-label="页面导航">
+        <button
+          class="frost-rail-item"
+          :class="{ 'is-active': page === 'control' }"
+          type="button"
+          @click="page = 'control'"
+        >
+          <Activity :size="17" :stroke-width="1.7" />
+          <span>统计面板</span>
+        </button>
         <button
           class="frost-rail-item"
           :class="{ 'is-active': page === 'npcap' }"
           type="button"
           @click="page = 'npcap'"
         >
-          <Database :size="17" :stroke-width="1.7" />
-          <span>Ncap 路径</span>
+          <Settings2 :size="17" :stroke-width="1.7" />
+          <span>设置</span>
         </button>
       </nav>
 

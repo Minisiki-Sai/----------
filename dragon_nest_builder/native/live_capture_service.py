@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Protocol
 
 from ..analytics import record_usage_event
+from .nest_inference import known_nest_keys
 from ..background_priority import (
     ForegroundLease, foreground_pending, score_checkpoint, score_execution,
 )
@@ -134,6 +135,8 @@ class NativeLiveCapture:
         self._active_effect_elapsed_seconds = 0.0
         self._active_effect_clock_monotonic = 0.0
         self._voice_clock_running = False
+        # 观测流水里 voice_state 的抽样节流（每秒最多一条）。
+        self._trace_voice_state_at = 0.0
         self._history_threads: set[threading.Thread] = set()
         # Raw capture is already closed, but the old worker may still freeze
         # statistics. Let the next-map probe capture that transition meanwhile.
@@ -350,10 +353,21 @@ class NativeLiveCapture:
             self._identity_import_thread.start()
         if self._auto_enabled and auto_start_monitor:
             self._ensure_auto_monitor_started()
-        if auto_start_monitor:
+        # 待机零抓包：默认不启动任何常驻探针。
+        #
+        # 2026-10 起「进本后才点开始统计」不再依赖待机时的实体档案，而是靠
+        # 服务端技能起始包里的技能号反查模板（`skill_identity` + 
+        # `_observe_skill_identity`）。技能号来自怪物技能表、全局唯一，进本
+        # 之后随时都能读到，所以待机抓包没有任何收益，只会白占 CPU/内存。
+        #
+        # 需要复现历史行为（诊断用）时设环境变量 DNACT_IDLE_PROBE=1。
+        self._idle_probe_enabled = str(
+            os.environ.get("DNACT_IDLE_PROBE", "")
+        ).strip().casefold() in {"1", "true", "yes", "on"}
+        if self._idle_probe_enabled:
             self._inspect_thread = threading.Thread(
                 target=self._inspect_loop,
-                name="V410TeammateInfoMonitor",
+                name="V410EntityProbe",
                 daemon=True,
             )
             self._inspect_thread.start()
@@ -1742,7 +1756,11 @@ class NativeLiveCapture:
                             discover_udp=True,
                             discover_tcp=True,
                             known_actor_names=self._cached_actor_names(cached_pid),
-                            identity_only=True,
+                            # 完整解码（否则 Boss 实体表建不起来），但不保留
+                            # 原始帧、不聚合、不落盘 —— 只为了「进本后才开统计」
+                            # 也能认出 Boss。
+                            identity_only=False,
+                            entity_only=True,
                             prebattle_udp=True,
                             # Known process ports are sufficient on a direct
                             # connection.  The explicit 45-second rediscovery
@@ -1780,6 +1798,24 @@ class NativeLiveCapture:
                     set_prebattle(not capture_busy)
                 self._ingest_probe_identities(probe_pid, probe)
                 self._drain_probe_profiles(probe_pid, probe)
+                # 诊断：待机实体探针是否真的建起了 Boss 档案。
+                try:
+                    decoder = getattr(probe, "_decoder", None)
+                    entities = getattr(decoder, "monster_entities", {}) or {}
+                    bosses = [
+                        template
+                        for template in entities.values()
+                        if getattr(template, "boss", False)
+                    ]
+                    self._state["entityProbe"] = {
+                        "active": True,
+                        "pid": probe_pid,
+                        "entities": len(entities),
+                        "bosses": len(bosses),
+                        "error": str(getattr(probe, "error", "") or "")[:200],
+                    }
+                except Exception:
+                    self._state["entityProbe"] = {"active": True, "error": "diagnostic-failed"}
                 if probe.error:
                     self._drain_probe_profiles(probe_pid, probe)
                     probe.close()
@@ -1801,6 +1837,24 @@ class NativeLiveCapture:
                 if self._identity_probe is probe:
                     self._identity_probe = None
                     self._identity_probe_pid = 0
+
+    def _idle_monster_entity_seeds(self, pid: int) -> dict[int, int]:
+        """待机探针收集到的 Boss 实体档案（actor -> 模板号）。"""
+
+        with self._identity_probe_lock:
+            probe = self._identity_probe if self._identity_probe_pid == pid else None
+        export = getattr(probe, "export_monster_entities", None)
+        if not callable(export):
+            return {}
+        try:
+            seeds = export()
+        except (RuntimeError, ValueError):
+            # 探针线程正在写字典时重试一次即可，不能因此阻塞开始统计。
+            try:
+                seeds = export()
+            except Exception:
+                return {}
+        return seeds if isinstance(seeds, dict) else {}
 
     def _idle_prebattle_snapshot(self, pid: int, boundary: float) -> dict[str, object] | None:
         with self._identity_probe_lock:
@@ -1843,10 +1897,11 @@ class NativeLiveCapture:
             pass
 
     def _load_auto_enabled(self, default: bool) -> bool:
-        payload = self._read_auto_settings()
-        if "auto_capture_enabled" not in payload:
-            return bool(default)
-        return bool(payload["auto_capture_enabled"])
+        # 待机零抓包：自动统计（进图自动开始）已移除。老版本可能把
+        # auto_capture_enabled=true 写进了设置文件，这里必须无视它，否则
+        # 一启动又会拉起抓包探针。
+        del default
+        return False
 
     def _save_auto_enabled(self) -> None:
         payload = self._read_auto_settings()
@@ -1931,6 +1986,8 @@ class NativeLiveCapture:
                 if overlay_snapshot is not None
                 else self._state.get("snapshot")
             )
+            collector = self._active_collector
+            live_bosses = self._live_bosses(collector) if collector is not None else []
             return {
                 "state": self._state.get("state", "idle"),
                 "status": self._state.get("status", ""),
@@ -1947,6 +2004,9 @@ class NativeLiveCapture:
                 "unconfiguredMapIds": self._state.get(
                     "unconfiguredMapIds", []
                 ),
+                # 「进本即绑定」的 Boss：出场包一到就有，不等它掉血。
+                # focus 白名单与悬浮窗 Boss 行的 A 链路都读这一份。
+                "liveBosses": live_bosses,
                 "overlaySnapshot": copy.deepcopy(snapshot),
                 "overlaySnapshotPublishedMonotonic": (
                     self._state.get("overlaySnapshotPublishedMonotonic")
@@ -2027,13 +2087,99 @@ class NativeLiveCapture:
             anchor = getattr(self, "_active_effect_clock_monotonic", 0.0)
             if anchor and self._state.get("state") == "running":
                 elapsed += max(0.0, time.monotonic() - anchor)
-            return {
+            payload = {
                 "state": self._state.get("state", "idle"),
                 "sessionId": self._timeline_session_id,
                 "elapsedSeconds": elapsed,
                 "clockRunning": getattr(self, "_voice_clock_running", True),
                 "voiceEvents": feed.snapshot() if feed is not None else [],
+                # 血量贴地后不再收到 0 包的 Boss：前端据此清掉它的倒计时/已好。
+                # 场景 Boss（P2 空中海龙）豁免：它选不中、血量长期 0.9%，
+                # 只靠技能行维持活跃，不该被静默阈值判成离场。
+                "retiredBossIds": (
+                    feed.retired_sources(
+                        int(elapsed * 1000),
+                        self._scene_templates_for(decoder),
+                    )
+                    if feed is not None
+                    else []
+                ),
             }
+        self._trace_voice_state(payload, decoder)
+        return payload
+
+    def _trace_voice_state(self, payload: dict[str, Any], decoder: Any) -> None:
+        """每秒把「前端做判断时看到的输入」写进观测流水。
+
+        抓包能重算事件，但 ``state`` / ``clockRunning`` / ``elapsedMs`` / ``focus``
+        只存在于运行时。缺了它们，回放只能证明「规则该播」，证明不了「播出去了」。
+        锁外调用，且无论如何都不抛出。
+        """
+
+        probe = getattr(decoder, "probe", None) if decoder is not None else None
+        if probe is None or not getattr(probe, "enabled", False):
+            return
+        now = time.monotonic()
+        if now - self._trace_voice_state_at < 1.0:
+            return
+        self._trace_voice_state_at = now
+        events = payload.get("voiceEvents") or []
+        last = events[-1] if events else {}
+        try:
+            probe.record(
+                "voice_state",
+                state=payload.get("state"),
+                clock=payload.get("clockRunning"),
+                elapsedMs=round(float(payload.get("elapsedSeconds") or 0.0) * 1000),
+                rows=len(events),
+                lastSeq=int(last.get("sequence") or 0),
+                lastTs=int(last.get("timestamp") or 0),
+                retired=len(payload.get("retiredBossIds") or ()),
+            )
+        except Exception:
+            pass
+
+    def record_probe_event(self, kind: str, fields: dict[str, Any]) -> bool:
+        """前端把「这一批事件怎么处理的」写进同一条观测流水。
+
+        这样一场副本只产生两份东西：``.dpscap``（原始帧）和 ``probe_*.jsonl``
+        （解码事实 + 运行时状态 + 前端处置）。回放时用它们就能逐条对账，
+        不需要再让用户复现。
+        """
+
+        with self._lock:
+            collector = self._active_collector
+            decoder = getattr(getattr(collector, "source", None), "_decoder", None)
+        probe = getattr(decoder, "probe", None) if decoder is not None else None
+        if probe is None or not getattr(probe, "enabled", False):
+            return False
+        clean = {
+            str(key): value
+            for key, value in dict(fields or {}).items()
+            if str(key) not in {"kind", "t"}
+        }
+        try:
+            probe.record(str(kind or "frontend_event"), **clean)
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _scene_templates_for(decoder: Any) -> tuple[int, ...]:
+        """当前副本声明的场景 Boss 模板（识别不到副本时为空）。
+
+        场景 Boss（梦魇海龙 P2 的空中海龙）选不中、血量长期贴地，只靠技能行
+        维持活跃。它们不参与离场判定，否则 180 秒静默阈值会把倒计时整行清掉
+        再重建，悬浮窗上就是一次闪烁。
+        """
+
+        try:
+            from .nest_inference import scene_boss_templates
+
+            key = str(getattr(decoder, "detected_nest_key", "") or "")
+            return tuple(sorted(scene_boss_templates(key)))
+        except Exception:
+            return ()
 
     def _reset_timeline_locked(self) -> None:
         self._timeline_events.clear()
@@ -2681,13 +2827,15 @@ class NativeLiveCapture:
                 self._timeline_events.popleft()
 
     def set_auto_enabled(self, enabled: bool) -> dict[str, Any]:
-        enabled = bool(enabled)
+        # 待机零抓包：自动统计已移除。即使外部调用传 True 也保持关闭，
+        # 不能在待机时悄悄拉起抓包探针。
+        enabled = False
         with self._lock:
             self._auto_enabled = enabled
             self._state.update(
                 autoEnabled=enabled,
-                autoStage="waiting_game" if enabled else "off",
-                autoStatus="等待游戏登录" if enabled else "自动统计已关闭",
+                autoStage="off",
+                autoStatus="自动统计已关闭",
             )
             self._save_auto_enabled()
         if enabled:
@@ -2991,12 +3139,214 @@ class NativeLiveCapture:
             ),
         }
 
+    def _inferred_nest(self, collector: LiveDpsCollector) -> dict[str, Any]:
+        """用「本机正在攻击的实体」反推副本。
+
+        只读聚合器里那张极小的 ``lastAttackTargets`` 表（待机零抓包后仍然由
+        伤害事件旁路维护），不构建快照，开销是一次 dict 查询。
+        """
+
+        from .nest_inference import infer_nest_from_attack_targets
+
+        aggregator = getattr(collector, "aggregator", None)
+        attacks = getattr(aggregator, "_overlay_last_attack_targets", None)
+        if not attacks:
+            self._state["nestInference"] = {"reason": "no-attack-target"}
+            return {}
+        # 优先用解码器的本机 actor（O(1)）；`_self_source_id` 会遍历本地
+        # actor 列表，放在每轮 poll 里没必要。
+        decoder = getattr(getattr(collector, "source", None), "_decoder", None)
+        self_source = ""
+        try:
+            actor = int(getattr(decoder, "current_self_actor_id", 0) or 0)
+            if actor > 0:
+                self_source = f"0x{actor & 0xFFFFFFFF:08X}"
+        except (TypeError, ValueError):
+            self_source = ""
+        if not self_source:
+            try:
+                self_source = self._self_source_id(collector)
+            except Exception:
+                self_source = ""
+        names = getattr(aggregator, "_overlay_target_names", None)
+        inferred = infer_nest_from_attack_targets(attacks, self_source, names)
+        if not inferred:
+            # 有攻击目标但都不在 Boss 模板表里（打小怪 / 副本未收录）。
+            self._state["nestInference"] = {
+                "reason": "unknown-target",
+                "self": self_source,
+                "names": dict(list((names or {}).items())[-6:]),
+                "targets": sorted(
+                    {
+                        str(
+                            value.get("targetId") if isinstance(value, dict) else value
+                        )
+                        for value in attacks.values()
+                    }
+                )[:8],
+            }
+            return {}
+        self._state["nestInference"] = {
+            "reason": "matched",
+            "self": self_source,
+            "templateId": int(inferred.get("nestTemplateId") or 0),
+            "nestKey": inferred.get("nestKey", ""),
+        }
+        return {
+            "nestKey": inferred["nestKey"],
+            "nestLabel": inferred["nestLabel"],
+            "nestName": inferred["nestName"],
+            "nestConfidence": inferred["nestConfidence"],
+            "nestTemplateId": int(inferred.get("nestTemplateId") or 0),
+            "nestObservedAt": round(time.time(), 3),
+            "nestMapId": 0,
+            "nestMapName": "",
+            "nestMapLayout": "",
+            "nestMapActive": False,
+            "unconfiguredMapIds": [],
+        }
+
+    def _live_bosses(self, collector: LiveDpsCollector) -> list[dict[str, Any]]:
+        """「本关」在场的 Boss：出场包绑到的、属于最新阶段的那些。
+
+        这是「进本即绑定」的唯一数据来源。Boss 出场包（88 字节 ``06 27 55 00``）
+        一到就进 ``boss_actor_ids``；血量包要等它掉血才发，实测能晚好几分钟，
+        所以这里**不看血量**。
+
+        ``boss_actor_ids`` 本身只增不减（Boss 死了不删，只有 actor 被复用时替换），
+        直接拿来当「在场」会一路累积，最后九只全在，A 链路永远不成立。所以按
+        解码器的**阶段编号**取最新一批：``_monster_birth_phase`` 记录每个 actor
+        出生时的阶段序号，换关时新 Boss 名字变化会让序号 +1。
+
+        同一阶段里仍有多个是正常的：红龙佩达 P1/P2 同名同阶段、终局本体 + 分身。
+        调用方给的是「这一关的 Boss 组」，不是单只。
+        """
+
+        decoder = getattr(getattr(collector, "source", None), "_decoder", None)
+        if decoder is None:
+            return []
+        entities = getattr(decoder, "monster_entities", None) or {}
+        actors = getattr(decoder, "boss_actor_ids", None) or ()
+        if not entities or not actors:
+            return []
+
+        # 悬浮窗 4 次/秒轮询这个状态，而 ``retired_sources`` 要扫一遍事件行。
+        # 一秒算一次足够：出场/死亡都是秒级事件，取不到更新晚一拍没有体感。
+        now = time.monotonic()
+        if now - float(getattr(self, "_live_bosses_at", 0.0) or 0.0) < 1.0:
+            return list(getattr(self, "_live_bosses_cache", ()) or ())
+
+        ended: set[str] = set()
+        ledger = getattr(
+            getattr(collector, "aggregator", None), "_boss_hp_ledger", None
+        )
+        if ledger is not None:
+            try:
+                ended = {str(value) for value in ledger.ended_target_ids()}
+            except Exception:
+                ended = set()
+
+        retired: set[str] = set()
+        feed = getattr(decoder, "voice_signal_feed", None)
+        if feed is not None:
+            elapsed = float(getattr(self, "_active_effect_elapsed_seconds", 0.0) or 0.0)
+            anchor = float(getattr(self, "_active_effect_clock_monotonic", 0.0) or 0.0)
+            if anchor and self._state.get("state") == "running":
+                elapsed += max(0.0, time.monotonic() - anchor)
+            try:
+                retired = {
+                    str(value)
+                    for value in feed.retired_sources(
+                        int(max(0.0, elapsed) * 1000),
+                        self._scene_templates_for(decoder),
+                    )
+                }
+            except Exception:
+                retired = set()
+
+        birth = getattr(decoder, "_monster_birth_phase", None) or {}
+        latest_phase = max((int(value) for value in birth.values()), default=0)
+        rows: list[tuple[float, int, int]] = []
+        for raw_actor in actors:
+            try:
+                actor_id = int(raw_actor)
+            except (TypeError, ValueError):
+                continue
+            template = entities.get(actor_id)
+            if template is None:
+                continue
+            # 只留最新阶段：旧关卡的 Boss 不删，靠阶段号把它挡在外面。
+            # 没有阶段记录的 actor（技能号反查补出来的，比如靠技能身份才认出
+            # 的梦魇海龙）一律视为本阶段——它们本来就是「现在这场」的线索。
+            phase = birth.get(actor_id)
+            if birth and phase is not None and int(phase) != latest_phase:
+                continue
+            try:
+                template_id = int(getattr(template, "template_id", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if template_id <= 0:
+                continue
+            target_id = f"0x{actor_id:08X}@{template_id}"
+            if target_id in ended or target_id in retired:
+                continue
+            rows.append((float(birth.get(actor_id, 0) or 0), actor_id, template_id))
+        rows.sort()
+
+        out: list[dict[str, Any]] = []
+        for _phase, actor_id, template_id in rows:
+            try:
+                name = str(decoder._monster_display_context(actor_id)[0] or "")
+            except Exception:
+                name = ""
+            out.append(
+                {
+                    "templateId": template_id,
+                    "actorId": f"0x{actor_id:08X}",
+                    "targetId": f"0x{actor_id:08X}@{template_id}",
+                    "name": name,
+                }
+            )
+        self._live_bosses_at = now
+        self._live_bosses_cache = out
+        return out
+
     @staticmethod
     def _detected_nest(collector: LiveDpsCollector) -> dict[str, Any]:
         source = getattr(collector, "source", None)
         return NativeLiveCapture._detected_nest_from_decoder(
             getattr(source, "_decoder", None)
         )
+
+    def _refresh_skill_identity_state(self, collector: LiveDpsCollector) -> None:
+        """把「技能号反查」的结果写进状态，供诊断接口查看。
+
+        每 2 秒刷一次就够了：学习索引本身按文件 mtime 缓存，这里只是把
+        「注入过哪些 actor、索引有多大」抄给 /api/capture/status。
+        """
+
+        now = time.monotonic()
+        if now - getattr(self, "_skill_identity_state_at", 0.0) < 2.0:
+            return
+        self._skill_identity_state_at = now
+        decoder = getattr(getattr(collector, "source", None), "_decoder", None)
+        seeds = getattr(decoder, "late_identity_seeds", None) or {}
+        try:
+            from .skill_identity import stats as skill_index_stats
+
+            index = skill_index_stats()
+        except Exception:
+            index = {}
+        self._state["skillIdentity"] = {
+            "indexSkills": int(index.get("skills", 0) or 0),
+            "indexPairs": int(index.get("pairs", 0) or 0),
+            "indexUpdatedAt": str(index.get("updatedAt", "") or ""),
+            "seedCount": len(seeds),
+            "seeds": {
+                f"0x{int(actor):08X}": int(template)
+                for actor, template in list(seeds.items())[:8]
+            },
+        }
 
     def start(
         self,
@@ -3091,6 +3441,10 @@ class NativeLiveCapture:
                 nestMapName="",
                 nestMapLayout="",
                 nestMapActive=False,
+                # 地图历史必须和身份字段一起清空。之前只清了 nestName 而保留
+                # nestMapHistory，导致上一轮的「黑龙巢穴（一）」会冒充本轮的
+                # 识别结果：日志里明明只有神圣天堂，界面上却能看到巢穴名。
+                nestMapHistory=[],
                 unconfiguredMapIds=[],
             )
             self._set_overlay_buff_published_revision(0)
@@ -3590,6 +3944,8 @@ class NativeLiveCapture:
                 ),
                 prebattle_tracker=self._idle_prebattle_tracker(pid),
                 toggles=self._toggles,
+                # 进本后才开统计：用探针的 Boss 档案把实体接上。
+                seed_monster_entities=self._idle_monster_entity_seeds(pid),
             )
             self._record_capture_start_stage(
                 "collectorReadyMs", requested_monotonic
@@ -3690,6 +4046,15 @@ class NativeLiveCapture:
                 # Identity/profile persistence runs on the session worker.
                 # Only the inexpensive decoded map observation stays here.
                 detected_nest = self._detected_nest(collector)
+                self._refresh_skill_identity_state(collector)
+                # 待机不抓包 → 进本那一刻的场景包错过了，此时场景识别要么为空、
+                # 要么识别成城镇/未配置地图。只要当前这行还不是「受支持的副本」，
+                # 就用「我正在打的 Boss」反推。已识别成受支持副本就跳过，别白算。
+                current_nest_key = str(self._state.get("nestKey") or "")
+                if current_nest_key not in known_nest_keys():
+                    detected_inferred = self._inferred_nest(collector)
+                    if detected_inferred:
+                        detected_nest = detected_inferred
                 identity_finished = time.monotonic()
                 for name, seconds in (
                     ("sourceReadMs", read_finished - poll_work_started),
@@ -3703,8 +4068,17 @@ class NativeLiveCapture:
                     )
                 if detected_nest:
                     with self._lock:
+                        current_nest_key = str(
+                            self._state.get("nestKey") or ""
+                        )
                         if (
-                            not self._state.get("nestKey")
+                            not current_nest_key
+                            # 之前是按目标反推的（confidence=inferred），
+                            # 真正的场景识别一到就让它接班，反过来则不允许。
+                            or self._state.get("nestConfidence")
+                            == "inferred"
+                            # 当前是城镇 / 未配置地图：不算识别成功，允许覆盖。
+                            or current_nest_key not in known_nest_keys()
                             or (
                                 detected_nest.get("nestConfidence")
                                 == "exact_map_id"
@@ -4259,6 +4633,14 @@ class NativeLiveCapture:
         thread = self._thread
         if thread is not None and thread.is_alive():
             thread.join(timeout=15.0)
+        # 技能号 -> 模板 的学习结果在会话结束时落盘：防抖写回只在流量持续时
+        # 触发，短会话必须在这里补一刀，否则下次还得重新学。
+        try:
+            from .skill_identity import save as save_skill_index
+
+            save_skill_index(force=True)
+        except Exception:
+            pass
         return self.status()
 
     def clear(self) -> dict[str, Any]:
@@ -4303,6 +4685,10 @@ class NativeLiveCapture:
                 nestMapName="",
                 nestMapLayout="",
                 nestMapActive=False,
+                # 地图历史必须和身份字段一起清空。之前只清了 nestName 而保留
+                # nestMapHistory，导致上一轮的「黑龙巢穴（一）」会冒充本轮的
+                # 识别结果：日志里明明只有神圣天堂，界面上却能看到巢穴名。
+                nestMapHistory=[],
                 unconfiguredMapIds=[],
             )
             self.snapshot_object = None

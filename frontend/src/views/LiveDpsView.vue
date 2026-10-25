@@ -46,15 +46,20 @@ const stateDetail = computed(() => {
 });
 
 const nestLabel = computed(() => capture.value?.nestLabel || capture.value?.nestName || "");
+// 进本后才开始统计时，副本不是从场景包读到的，而是按「正在打的 Boss」反推的。
+// 标一下，避免用户以为识别出了确定值。
+const nestInferred = computed(() => String(capture.value?.nestConfidence || "") === "inferred");
 
 function toggleClass(key: string) {
   return key === "boss_actions" ? "is-warm" : "is-blue";
 }
 
 function toggleHint(key: string) {
+  // 关闭即停止该类事件的聚合与推送（省掉后续计算），但解码不停：语音播报
+  // 用的是同一批包，关掉悬浮窗后仍然照常出声。
   return key === "boss_actions"
-    ? "关闭后停止该类报文的解析与倒计时推送"
-    : "关闭后停止增益/减益事件的解析与悬浮窗推送";
+    ? "关闭后停止该类事件的解析与推送，语音播报照常"
+    : "关闭后停止增益/减益事件的解析与推送，语音播报照常";
 }
 
 function onToggle(key: string, event: Event) {
@@ -82,7 +87,11 @@ async function adjustLayout() {
         <p class="frost-status-detail" :title="stateDetail">{{ stateDetail }}</p>
       </div>
       <div class="frost-status-meta">
-        <span v-if="nestLabel" class="frost-chip">{{ nestLabel }}</span>
+        <span
+          v-if="nestLabel"
+          class="frost-chip"
+          :title="nestInferred ? '进本后才开始统计，按你正在攻击的 Boss 反推的副本' : ''"
+        >{{ nestLabel }}<small v-if="nestInferred"> · 推断</small></span>
       </div>
     </header>
 

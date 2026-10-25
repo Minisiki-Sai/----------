@@ -1,5 +1,6 @@
 import type { BuffOverlaySettings, BuffOverlayStatus } from "../types/api";
 import type { OverlayWindowKind } from "./buffOverlaySettings";
+import { captureToggleAllows, type CaptureToggleState } from "./captureToggles.ts";
 
 export type OverlayLatencySample = {
   captureToDecodeMs?: number;
@@ -72,11 +73,16 @@ export function overlayDomWorkNeeded(
 export function combatOverlaySnapshotNeeded(
   globallyVisible: boolean,
   settings: BuffOverlaySettings,
+  toggles?: CaptureToggleState,
 ): boolean {
   if (!globallyVisible) return false;
-  return settings.showBuffOverlay
-    || settings.showSkillCountdownOverlay
-    || settings.showDebuffOverlay;
+  // 首页总开关关掉的那一类不用再拉快照：窗口已经隐藏，省一次 150~500ms 的轮询。
+  // 语音播报不依赖这份快照（它自己读 /api/capture/voice-events）。
+  const statusNeeded = captureToggleAllows("buffs", toggles)
+    && (settings.showBuffOverlay || settings.showDebuffOverlay);
+  const skillNeeded = captureToggleAllows("boss_actions", toggles)
+    && settings.showSkillCountdownOverlay;
+  return statusNeeded || skillNeeded;
 }
 
 function finite(value: unknown): number {

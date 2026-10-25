@@ -1308,8 +1308,11 @@ class NativeSimulatorCore(NativeCustomTeamMixin, NativeOverlayMixin, NativeProfi
             score_ready_callback=None,
             replay_cache_ready_callback=None,
             auto_settings_path=live_capture_settings_path,
-            auto_default_enabled=(int(APP_VERSION_COMPACT) >= 420),
-            auto_start_monitor=(int(APP_VERSION_COMPACT) >= 420),
+            # 待机零抓包：不再启动自动统计探针和身份监听探针。
+            # 只有点「开始统计」那一刻才创建 Npcap 流；进本后才开统计时，
+            # 副本与 Boss 靠「本机正在攻击的目标」反推（见 nest_inference）。
+            auto_default_enabled=False,
+            auto_start_monitor=False,
             timeline_store=self.store,
             identity_cache_path=(
                 Path.home()

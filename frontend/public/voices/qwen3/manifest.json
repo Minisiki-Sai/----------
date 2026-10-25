@@ -3,10 +3,10 @@
   "revision": "0c0e3051f131929182e2c023b9537f8b1c68adfe",
   "license": "Apache-2.0",
   "voices": [
+    "Vivi2",
+    "Xiaohe",
     "Vivian",
-    "Serena",
-    "Uncle_Fu",
-    "Dylan"
+    "Serena"
   ],
   "phrases": {
     "语音播报试听，请注意战斗机制": "6e374ea8798f2e55",

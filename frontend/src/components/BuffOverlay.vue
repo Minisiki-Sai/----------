@@ -9,16 +9,18 @@ const {
   skillCountdownRows,
   settings, captureNotice,
   layoutMode, overlayShell, isStatusView, isSkillView, layoutTitle,
-  captureActive, statusRows, standardStatusRows, compactEffectRows,
+  statusRows, standardStatusRows, compactEffectRows,
   statusListStyle, statusIconListStyle, shellStyle, rowStyle, rowWidth, remainingText,
   rowIconStyle, rowIconProgressStyle, rowIconLabel,
   beginDrag, finishLayoutMode, toggleDebuffBreakdown,
+  showEmptySection, emptyStateText, hiddenSelectedBuffCount,
+  skillIdentity, skillIdentityVisible,
 } = useBuffOverlay({ view: props.view });
 </script>
 
 <template>
   <main
-    v-show="layoutMode || statusRows.length || skillCountdownRows.length || captureNotice"
+    v-show="layoutMode || statusRows.length || skillCountdownRows.length || captureNotice || showEmptySection || skillIdentityVisible"
     ref="overlayShell"
     class="buff-overlay-shell"
     :class="[view === 'skill' ? 'is-skill' : 'is-status', { 'layout-mode': layoutMode }]"
@@ -34,6 +36,29 @@ const {
     <button v-if="!layoutMode" class="drag-handle" title="按住拖动悬浮窗" @pointerdown.left="beginDrag">
       <GripVertical :size="12" />
     </button>
+
+    <!-- 第一、二行：当前副本与 Boss 的身份。它替代了原来那句「采集中」，
+         让窗口在没有任何技能倒计时时也能说明自己在看什么。 -->
+    <section v-if="skillIdentityVisible" class="skill-identity" aria-label="副本与 Boss 识别结果">
+      <p class="skill-identity-line">
+        <span class="skill-identity-key">{{ skillIdentity.nest.prefix }}:</span>
+        <strong>{{ skillIdentity.nest.name || "未识别" }}</strong>
+        <small
+          v-if="skillIdentity.nest.label"
+          class="skill-identity-tag"
+          :class="skillIdentity.nest.state"
+        >{{ skillIdentity.nest.label }}</small>
+      </p>
+      <p class="skill-identity-line">
+        <span class="skill-identity-key">{{ skillIdentity.boss.prefix }}:</span>
+        <strong>{{ skillIdentity.boss.name || "未识别" }}</strong>
+        <small
+          v-if="skillIdentity.boss.label"
+          class="skill-identity-tag"
+          :class="skillIdentity.boss.state"
+        >{{ skillIdentity.boss.label }}</small>
+      </p>
+    </section>
 
     <SkillCountdownPanel
       v-if="isSkillView && skillCountdownRows.length"
@@ -86,11 +111,22 @@ const {
     </section>
 
     <section
-      v-if="!layoutMode && !captureNotice && (isSkillView ? !skillCountdownRows.length : !statusRows.length)"
+      v-if="showEmptySection"
       class="overlay-empty"
+      :title="view === 'skill' ? '采集进行中，暂无需要预告的 Boss 技能' : '采集进行中；若已挂上增益仍显示此项，请到悬浮窗设置里勾选对应增益'"
     >
       <Activity :size="14" />
-      <span>{{ layoutMode ? '此悬浮窗未启用内容（模拟预览）' : captureActive ? '当前没有选中的内容' : '等待实时统计' }}</span>
+      <span>{{ emptyStateText }}</span>
+    </section>
+
+    <!-- Rows are up, but the saved whitelist still hides some active Buffs.
+         Without this chip the overlay looked incomplete with no explanation. -->
+    <section
+      v-if="!layoutMode && isStatusView && statusRows.length && hiddenSelectedBuffCount > 0"
+      class="overlay-hidden-hint"
+      title="这些增益在「悬浮窗设置 → Buff」里没有勾选，点全选即可全部显示"
+    >
+      <span>另有 {{ hiddenSelectedBuffCount }} 项增益未勾选</span>
     </section>
   </main>
 </template>
@@ -326,6 +362,61 @@ const {
   min-height: 32px;
   color: var(--ov-ink-soft);
   font-size: 11.5px;
+}
+
+/* 副本 / Boss 两行身份：字号与技能面板表头一致，不抢行内容的视觉重量。 */
+.skill-identity {
+  display: grid;
+  gap: 1px;
+  padding: 2px 5px 4px;
+}
+
+.skill-identity-line {
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+  margin: 0;
+  min-width: 0;
+  color: var(--ov-ink);
+  font-size: calc(var(--overlay-font-size, 13px) - 1px);
+  line-height: 1.45;
+}
+
+.skill-identity-key {
+  flex: 0 0 auto;
+  color: var(--ov-ink-soft);
+}
+
+.skill-identity-line strong {
+  min-width: 0;
+  overflow: hidden;
+  font-weight: 600;
+  letter-spacing: .01em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.skill-identity-tag {
+  flex: 0 0 auto;
+  font-size: 10px;
+  letter-spacing: .02em;
+}
+
+.skill-identity-tag.announced { color: #4f7d5f; }
+.skill-identity-tag.muted { color: #a1653c; }
+/* 城镇/庭院：识别到了但不是副本，用中性灰避免被读成「这个副本不播报」。 */
+.skill-identity-tag.nonNest { color: var(--ov-ink-soft); opacity: .82; }
+
+.overlay-hidden-hint {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  min-height: 14px;
+  padding: 2px 4px 0;
+  color: var(--ov-ink-soft);
+  font-size: 10px;
+  letter-spacing: .02em;
+  opacity: .72;
 }
 
 /* 位置调整：保持与外皮一致的盒模型，只加虚线提示 */

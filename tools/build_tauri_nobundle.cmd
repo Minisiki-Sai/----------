@@ -3,11 +3,11 @@ setlocal EnableExtensions
 rem Build the desktop shell without an installer bundle.
 rem The MSVC/SDK environment is assembled explicitly instead of VsDevCmd.bat,
 rem because that script shells out to reg.exe which this sandbox blocks.
-set "MSVC_ROOT=E:\vs_build_tools\VC\Tools\MSVC\14.50.35717"
+set "MSVC_ROOT=C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207"
 set "SDK_ROOT=C:\Program Files (x86)\Windows Kits\10"
 set "SDK_VER=10.0.26100.0"
 if not exist "%MSVC_ROOT%\bin\Hostx64\x64\link.exe" (
-    echo [portable] MSVC link.exe not found under %MSVC_ROOT%
+    echo [portable] MSVC link.exe not found under "%MSVC_ROOT%"
     exit /b 1
 )
 

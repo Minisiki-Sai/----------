@@ -42,8 +42,11 @@ def party_boss_health(snapshot: dict, player_ids: set[str]) -> list[dict]:
     if roster:
         # An explicit roster outranks unrelated players observed earlier.
         player_ids = player_ids & (roster | {str(snapshot.get("selfSourceId") or "")})
-    targets = {row.get("targetId") for actor, row in
-               (snapshot.get("lastAttackTargets") or {}).items() if actor in player_ids}
+    # 这里刻意保留「永久」目标表：队伍血条不该因为整队跑位 15 秒没输出就整排
+    # 消失。而「Boss 行跟谁走」「分边按哪一侧过滤」用的是带时效的另一张表
+    # （见 overlay_service.current_attack_targets）。
+    attacks = snapshot.get("lastAttackTargets") or {}
+    targets = {row.get("targetId") for actor, row in attacks.items() if actor in player_ids}
     return [row for row in snapshot.get("bossHealth", [])
             if row.get("targetId") in targets and row.get("targetId") not in ended
             and (row.get("currentHp") != 0 or row.get("partId") in (4150061, 4150062))]

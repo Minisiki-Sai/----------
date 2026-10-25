@@ -6,6 +6,7 @@ from ..damage_attribution import should_prefer_damage_object_skill, should_repla
 from ..damage_wire_evidence import damage_wire_metadata
 from ..protocol_v576 import decode_v576_embedded_direct41_damage_events
 from ..aura_state import AURA_SKILL_IDS
+from ..nest_probe import relaxed_skill_candidates
 
 class V576StatusDecoderMixin:
     @staticmethod
@@ -1490,6 +1491,130 @@ class V576StatusDecoderMixin:
         self.recent_emitted_casts[cast_key] = packet.timestamp_seconds
         self.structured_action_emitted += 1
         return result
+    def _observe_skill_identity(self, packet: PacketRecord, direction: str | None = None) -> None:
+        """用技能号反查 Boss 模板，补齐中途开抓时缺失的实体表。
+
+        怪物出场包（88 字节 ``06 27 55 00``）只在 Boss 出场那一刻出现，进本之后
+        才开统计就永远看不到它，于是实体表为空、血量包和技能包全被丢掉。技能号
+        来自服务端怪物技能表、全局唯一，是本包里唯一还能读到的身份线索：
+
+        * 实体表健康时 -> ``(技能号, 模板)`` 是确定配对，写进自学习索引；
+        * 实体表为空时 -> 用技能号查出模板，注入 ``monster_entities``，并顺带
+          补上 ``boss_actor_ids``；后续血量/技能/语音全部回到老逻辑。
+        """
+
+        if packet.transport.upper() != "UDP":
+            return
+        payload = packet.payload
+        if len(payload) < 38:
+            return
+        direction = direction or packet.inferred_direction()
+        if direction != "server_to_client":
+            return
+
+        # 身份已经确认时，这条链路只剩「学新技能号」的价值，抽样跑即可：
+        # relaxed_skill_records 要对整包做 13 个 XOR 相位的试解，每包都跑
+        # 等于把热路径的成本翻倍。Boss 每次放技能都会连发多条记录，1/4 采样
+        # 足够学到号；而身份未知时必须每包都扫，这是唯一的身份线索。
+        if self.boss_actor_ids:
+            serial = getattr(self, "_skill_learn_serial", 0) + 1
+            self._skill_learn_serial = serial
+            if serial % 4:
+                return
+
+        from ..nest_probe import relaxed_skill_records
+
+        records = relaxed_skill_records(payload)
+        if not records:
+            return
+        from dragon_nest_builder.native.skill_identity import (
+            catalog_template,
+            learn_skill_template,
+            resolve_skill_template,
+            save as save_skill_index,
+        )
+
+        from dragon_nest_builder.native.nest_inference import (
+            known_nest_keys,
+            template_nest_index,
+        )
+
+        entities = self.monster_entities
+        players = self.local_actor_ids | set(self.known_actor_names) | self.skill_actor_ids
+        nest_templates = template_nest_index()
+        seeds: dict[int, int] = {}
+        for actor_id, skill_id in records:
+            template = entities.get(actor_id)
+            if template is not None:
+                # 实体表健康：技能号与模板的配对是确定的，直接进学习索引。
+                if learn_skill_template(skill_id, int(template.template_id)):
+                    save_skill_index()
+                continue
+            if actor_id in players:
+                continue
+            template_id = resolve_skill_template(skill_id)
+            if not template_id:
+                # 还没学过的技能号：退回技能目录的 Boss 词干唯一匹配。
+                template_id = catalog_template(
+                    skill_id, self.monster_templates, nest_templates
+                )
+            if not template_id:
+                continue
+            resolved = self.monster_templates.get(template_id)
+            if resolved is None:
+                continue
+            # 只认 Boss / 副本 Boss 模板。30xxx 这类技能号是场景通用物体
+            # （偷袭点、自动贩卖机），跨副本复用，不能当身份证据。
+            if not (getattr(resolved, "boss", False) or template_id in nest_templates):
+                continue
+            seeds[actor_id] = template_id
+        if not seeds:
+            return
+        applied = self.seed_monster_entities(seeds)
+        if applied <= 0:
+            return
+
+        late = getattr(self, "late_identity_seeds", None)
+        if late is None:
+            late = self.late_identity_seeds = {}
+        for actor_id, template_id in seeds.items():
+            late[actor_id] = template_id
+            self.probe.record(
+                "skill_identity",
+                actor=f"0x{actor_id:08X}",
+                template_id=int(template_id),
+                bossActorCount=len(self.boss_actor_ids),
+            )
+
+        from dragon_nest_builder.native.nest_inference import known_nest_keys
+
+        if str(self.detected_nest_key or "") in known_nest_keys():
+            return
+        from ..nest_recognizer import resolve_nest_template
+
+        for template_id in seeds.values():
+            resolution = resolve_nest_template(template_id)
+            if resolution is None:
+                continue
+            profile = resolution.profile
+            origin = self.first_timestamp or packet.timestamp_seconds
+            self.detected_nest_key = profile.key
+            self.detected_nest_label = profile.label
+            self.detected_nest_name = profile.display_name
+            self.detected_nest_confidence = resolution.confidence
+            self.detected_nest_template_id = template_id
+            self.detected_nest_observed_at = max(
+                0.0, packet.timestamp_seconds - origin
+            )
+            self.probe.record(
+                "nest_identity",
+                route="skill_identity",
+                template_id=int(template_id),
+                nest_key=self.detected_nest_key,
+                nest_name=self.detected_nest_name,
+            )
+            break
+
     def _legacy_boss_action_events(self, packet: PacketRecord) -> list[BossActionEvent]:
         if (
             packet.transport.upper() != "UDP"
@@ -1511,7 +1636,14 @@ class V576StatusDecoderMixin:
         events: list[BossActionEvent] = []
         for decoded in decoded_actions:
             template = self.monster_entities.get(decoded.source_actor_id)
-            if template is None or not template.boss:
+            if template is None or not self._is_boss_actor(decoded.source_actor_id):
+                self.note_skill_drop(
+                    "legacy_boss_action:trivial_actor"
+                    if template is not None
+                    else "legacy_boss_action:unknown_actor",
+                    decoded.source_actor_id,
+                    getattr(decoded, "action_code", 0),
+                )
                 continue
             catalog_name, mapped = self.boss_action_catalog.get(
                 (template.template_id, decoded.action_code),
@@ -1586,9 +1718,42 @@ class V576StatusDecoderMixin:
                 self.boss_actor_ids, self.boss_skill_catalog)
             if is_server_udp and self.boss_actor_ids else ()
         )
+        probe = getattr(self, "probe", None)
+        if probe is not None and getattr(probe, "enabled", False):
+            # 观测：三段通道各自解出了什么。skill_starts 只会有白名单内的号，
+            # 所以额外做一次「去掉白名单」的扫描，看这只 Boss 还发了哪些未知技能号。
+            known = set(self.boss_skill_catalog)
+            if direct_actions or structured_actions or skill_starts:
+                probe.record(
+                    "boss_channels",
+                    direct=[(int(d.action_code), int(d.skill_index)) for d in direct_actions],
+                    structured=[(int(d.action_code), int(d.skill_index)) for d in structured_actions],
+                    starts=[int(d.skill_index) for d in skill_starts],
+                    actors=[f"0x{int(a):08X}" for a in self.boss_actor_ids],
+                )
+            seen = getattr(self, "_probe_skill_seen", None)
+            if seen is None:
+                seen = self._probe_skill_seen = set()
+            for skill in relaxed_skill_candidates(packet.payload, set(self.boss_actor_ids)):
+                if skill in seen:
+                    continue
+                seen.add(skill)
+                probe.record(
+                    "skill_candidate",
+                    skill=int(skill),
+                    in_catalog=skill in known,
+                    name=str(self.boss_skill_catalog.get(skill, ""))[:40],
+                )
         for decoded in (*direct_actions, *structured_actions, *skill_starts):
             template = self.monster_entities.get(decoded.source_actor_id)
-            if template is None or not template.boss:
+            if template is None or not self._is_boss_actor(decoded.source_actor_id):
+                self.note_skill_drop(
+                    "boss_action:trivial_actor"
+                    if template is not None
+                    else "boss_action:unknown_actor",
+                    decoded.source_actor_id,
+                    getattr(decoded, "skill_index", getattr(decoded, "action_code", 0)),
+                )
                 continue
             catalog_name, mapped = self.boss_action_catalog.get(
                 (template.template_id, decoded.action_code),
@@ -1659,7 +1824,7 @@ class V576StatusDecoderMixin:
             and decoded_hit.damage > 0
         ):
             template = self.monster_entities.get(decoded_hit.source_actor_id)
-            if template is not None and template.boss:
+            if template is not None and self._is_boss_actor(decoded_hit.source_actor_id):
                 signature = (
                     packet.payload[5:9].hex() if len(packet.payload) >= 9 else ""
                 )
@@ -1736,7 +1901,14 @@ class V576StatusDecoderMixin:
             ):
                 continue
             template = self.monster_entities.get(status.source_actor_id)
-            if template is None or not template.boss:
+            if template is None or not self._is_boss_actor(status.source_actor_id):
+                self.note_skill_drop(
+                    "boss_status:trivial_actor"
+                    if template is not None
+                    else "boss_status:unknown_actor",
+                    status.source_actor_id,
+                    status.skill_id,
+                )
                 continue
             raw_code = int(status.skill_id or 0)
             family_key = (

@@ -32,6 +32,7 @@ exports/
 *.log
 
 # Temporary files
+.dev/
 *.tmp
 *.bak*
 ~$*
@@ -50,3 +51,9 @@ dragon_nest_builder/data/modular/supabase_score_sync.json
 # Local user state
 skill_build_schemes/
 user_data/
+
+# 本机设置（npcap.json / debug_recording.json），不进仓库
+/data/
+
+# TTS 凭据（火山 AppID / Access Token），绝不提交
+tools/tts/tts_cred.json

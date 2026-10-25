@@ -54,6 +54,15 @@ export class NestSkillCooldownClock {
   private dragonSource='';
   clear(){this.timers.clear();this.dead.clear();this.retired.clear();this.recent.clear();this.hp.clear();this.dragonSource='';}
   private cancel(src:string){for(const [key,row] of this.timers)if(row.source===src)this.timers.delete(key);}
+  /** 换边后丢掉刚离开那一侧 Boss 的倒计时（不标记已死：切回来仍会重新计时）。 */
+  forgetTemplates(templates:readonly number[]){
+    const set=new Set(templates.map(Number).filter(v=>v>0));
+    if(!set.size)return;
+    for(const [key,row] of [...this.timers]){
+      const rule=NEST_COOLDOWN_RULES.find(r=>r.key===row.ruleKey);
+      if(rule&&rule.templates.some(t=>set.has(Number(t))))this.timers.delete(key);
+    }
+  }
   private extend(src:string,key:string,deadline:number){const timer=this.timers.get(`${src}:${key}`);if(timer){timer.deadline=Math.max(timer.deadline,deadline);timer.durationMs=timer.deadline-timer.start;}}
   observe(rows:NestCountdownEvent[],nest:string){
     for(const e of rows)if(e.hpPercent===0||e.kind==='boss_entity_end'){this.dead.add(e.source);this.cancel(e.source);}

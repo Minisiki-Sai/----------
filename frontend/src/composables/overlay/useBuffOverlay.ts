@@ -25,7 +25,10 @@ import {
 } from "../../utils/overlayEventBus";
 import { OVERLAY_EVENT_TOPICS } from "../../utils/overlayEventProtocol";
 import { browserLayoutPreviewRequested } from "../../utils/overlayLayoutPreview";
+import { onOverlayLayoutModeChange, readOverlayLayoutMode } from "../../utils/overlayLayoutFlag";
 import { visibleSkillCountdowns, SKILL_COUNTDOWN_OPTIONS, type SkillCountdownSnapshot } from "../../utils/skillCountdowns";
+import { resolveSkillIdentity } from "../../utils/overlayIdentity";
+import { VOICE_KEY, normalizeVoiceSettings } from "../../utils/voiceAnnouncements";
 
 type OverlayTone = keyof BuffOverlaySettings["toneColors"];
 type OverlayRow = { key: string; colorKey: string; name: string; sourceJob: string; detail: string; remaining: number; duration: number; permanent: boolean; tone: OverlayTone; groupOrder: number; sortOrder: number };
@@ -56,6 +59,9 @@ export function useBuffOverlay(props: BuffOverlayProps) {
   let clockTimerDelay = 0;
   let enabledTimer: number | null = null;
   let enabled = false;
+  // Mirrors `enabled` as reactive state: the shell now stays on screen for the
+  // whole capture session, so a plain variable could not drive `v-show`.
+  const shellVisible = ref(false);
   // The close notice is asynchronous. Guard it with a capture generation so
   // a stale stopped snapshot cannot hide a window reopened by a newer Start.
   let captureLifecycleGeneration = 0;
@@ -65,6 +71,7 @@ export function useBuffOverlay(props: BuffOverlayProps) {
   let settingsUnlisten: UnlistenFn | null = null;
   let captureNoticeUnlisten: UnlistenFn | null = null;
   let layoutModeUnlisten: UnlistenFn | null = null;
+  let layoutFlagUnlisten: (() => void) | null = null;
   let snapshotUnlisten: OverlayEventUnlisten | null = null;
   let snapshotRequestTimer: number | null = null;
   let snapshotRequestAttempts = 0;
@@ -87,11 +94,13 @@ export function useBuffOverlay(props: BuffOverlayProps) {
   let lastDevicePixelRatio = window.devicePixelRatio || 1;
   let cachedMonitorScaleFactor = 0;
   const OVERLAY_NATIVE_RESIZE_DEBOUNCE_MS = 100;
+  const OVERLAY_NATIVE_RESIZE_TIMEOUT_MS = 1_500;
   const STATUS_PANEL_GAP = 4;
   const {
     windowLabel, isStatusView, isSkillView, layoutTitle,
     textValue, numberValue, captureActive,
     rows, buffRows, debuffRows, statusRows, standardStatusRows, compactEffectRows,
+    hiddenSelectedBuffCount,
     overlayLayout, statusListStyle, statusIconListStyle, shellStyle, rowStyle,
     rowWidth, remainingText, rowIconStyle, rowIconProgressStyle, rowIconLabel,
     toggleDebuffBreakdown,
@@ -105,6 +114,8 @@ export function useBuffOverlay(props: BuffOverlayProps) {
     layoutMode,
     statusPanelGap: STATUS_PANEL_GAP,
     skillCountdownCount: () => skillPanelRowCount.value,
+    // 技能窗顶部两行身份要计入原生窗口高度，否则第一行会被裁掉。
+    identityRowCount: () => (skillIdentityVisible.value ? 2 : 0),
   });
   function loadSettings() {
     const raw = localStorage.getItem(BUFF_OVERLAY_STORAGE_KEY) || "";
@@ -112,6 +123,37 @@ export function useBuffOverlay(props: BuffOverlayProps) {
     settingsSignature = raw;
     settings.value = readBuffOverlaySettings();
   }
+  // 语音播报白名单：只认「副本」这一层（设置页里勾了哪几个巢穴）。
+  // 每次快照刷新都重读一次，主界面改完配置后这里最多晚一个刷新周期。
+  const voiceNestWhitelist = computed(() => {
+    void payload.value;
+    try {
+      const normalized = normalizeVoiceSettings(JSON.parse(localStorage.getItem(VOICE_KEY) || "{}"));
+      return normalized.nests;
+    } catch {
+      return ["classic", "hard", "sand-hard", "sea-nightmare"];
+    }
+  });
+  // 悬浮窗前两行的身份：副本 / Boss。判定规则集中在 resolveSkillIdentity 里，
+  // 方便单独回归测试（已识别 / 不播报 / 非副本 / 未识别 四种状态）。
+  // sceneName 由后端从地图历史给出，包含城镇，因此「抓到包就不会显示未识别」。
+  const skillIdentity = computed(() => resolveSkillIdentity({
+    nestName:
+      textValue(payload.value?.sceneName) ||
+      textValue(payload.value?.nestLabel) ||
+      textValue(payload.value?.nestName),
+    bossName: textValue(payload.value?.bossName),
+    whitelist: voiceNestWhitelist.value,
+    sceneKind: textValue(payload.value?.sceneKind),
+    sample: layoutMode.value,
+  }));
+  // 身份两行（副本 / Boss）属于**技能播报窗**：进副本后显示在技能列表上方。
+  // 增益/减益窗不显示，那里保持原来那句「采集中」。
+  // 只有真正识别到副本（announced/muted）才显示；主城、庭院、未识别时让位给「采集中」。
+  const skillIdentityVisible = computed(() => isSkillView.value
+    && shellVisible.value
+    && (skillIdentity.value.nest.state === "announced"
+      || skillIdentity.value.nest.state === "muted"));
     function isTauri(): boolean { return "__TAURI_INTERNALS__" in window; }
   async function beginDrag() { if (isTauri()) try { await invoke("begin_buff_overlay_drag", { windowLabel: windowLabel.value }); } catch { /* Browser preview. */ } }
   async function setCurrentOverlayVisible(visible: boolean) {
@@ -124,17 +166,32 @@ export function useBuffOverlay(props: BuffOverlayProps) {
     } catch { /* The main window also controls global visibility. */ }
     finally { syncOverlayDomWork(); }
   }
+  let layoutMeasureTimers: number[] = [];
+  function clearLayoutMeasureTimers() {
+    for (const timer of layoutMeasureTimers) window.clearTimeout(timer);
+    layoutMeasureTimers = [];
+  }
   function setLayoutMode(next: boolean) {
     layoutMode.value = next;
+    clearLayoutMeasureTimers();
     syncOverlayDomWork();
-    // Native positioning may restore the previous (empty) window bounds.
-    // Force a fresh size after the preview DOM has been rendered, even if our
-    // cached last-applied dimensions happen to match the desired dimensions.
-    if (next) void nextTick().then(() => {
-      if (!layoutMode.value || !componentMounted) return;
-      appliedOverlaySize = { width: 0, height: 0 };
-      return measureAndResizeOverlay(true, true);
-    });
+    // A cold overlay WebView reports an empty shell on the first frame, so a
+    // single measurement right after nextTick used to leave the preview
+    // clipped until the user clicked "调整位置" a second time. Re-measure on a
+    // short schedule until the preview DOM (and its fonts) have settled.
+    const scheduleMeasure = (delay: number) => {
+      layoutMeasureTimers.push(window.setTimeout(() => {
+        if (!layoutMode.value || !componentMounted) return;
+        // Native positioning may restore the previous (empty) window bounds.
+        appliedOverlaySize = { width: 0, height: 0 };
+        void measureAndResizeOverlay(true, true);
+      }, delay));
+    };
+    void nextTick().then(() => scheduleMeasure(0));
+    scheduleMeasure(120);
+    if (!next) return; // Leaving layout mode only needs the window to shrink back.
+    scheduleMeasure(400);
+    scheduleMeasure(900);
   }
   async function finishLayoutMode() {
     if (!isTauri()) { setLayoutMode(false); return; }
@@ -265,14 +322,25 @@ export function useBuffOverlay(props: BuffOverlayProps) {
     if (!next || sizesAreEquivalent(next, appliedOverlaySize)) return;
     overlayResizeInFlight = true;
     const resizeStartedAt = performance.now();
+    let timedOut = false;
     try {
       overlayResizeRequest = invoke<void>("set_buff_overlay_size", {
         width: next.width,
         height: next.height,
         windowLabel: windowLabel.value,
       });
-      await overlayResizeRequest;
-      appliedOverlaySize = next;
+      // A native size request runs on Tauri's GUI thread.  When that thread is
+      // busy (a WebView2 creation, a tray/drag operation) the promise can stay
+      // pending for tens of seconds; measured 49.7 s in the field.  Waiting
+      // here blocked every later resize, so rows arrived while the window kept
+      // its old (tiny) height and the overlay looked empty.  Bound the wait and
+      // retry through the normal measurement path instead.
+      await Promise.race([        overlayResizeRequest,
+        new Promise<void>(resolve => {
+          window.setTimeout(() => { timedOut = true; resolve(); }, OVERLAY_NATIVE_RESIZE_TIMEOUT_MS);
+        }),
+      ]);
+      if (!timedOut) appliedOverlaySize = next;
     } catch {
       // A WebView can finish mounting just before its native window becomes
       // available. Retry the newest stable DOM measurement, not every
@@ -297,6 +365,14 @@ export function useBuffOverlay(props: BuffOverlayProps) {
       }
       overlayResizeInFlight = false;
       overlayResizeRequest = null;
+      if (timedOut && overlayDomWorkActive && overlayResizeRetryTimer === null) {
+        // The native call is still queued; re-measure soon so the window catches
+        // up as soon as the GUI thread responds.
+        overlayResizeRetryTimer = window.setTimeout(() => {
+          overlayResizeRetryTimer = null;
+          scheduleOverlayMeasurement();
+        }, 600);
+      }
       scheduleNativeOverlayResize();
     }
   }
@@ -387,7 +463,7 @@ export function useBuffOverlay(props: BuffOverlayProps) {
       return;
     }
     localStorage.setItem("dragon-nest-v420-buff-overlay-enabled", "0");
-    enabled = false;
+    setOverlayEnabled(false);
     stopTimers();
     if (isTauri()) {
       try { await invoke("set_buff_overlay_visible", { visible: false }); }
@@ -396,7 +472,6 @@ export function useBuffOverlay(props: BuffOverlayProps) {
     closingAfterCaptureStop = false;
   }
   function applyPayload(incoming: BuffOverlayStatus) {
-      if (!enabled) return;
       if (snapshotRequestTimer !== null) window.clearTimeout(snapshotRequestTimer);
       snapshotRequestTimer = null;
       const next: BuffOverlayStatus = {
@@ -418,6 +493,10 @@ export function useBuffOverlay(props: BuffOverlayProps) {
       // different clock than the backend and could display them as permanent.
       baseSeconds.value = authoritativeSeconds;
       payload.value = next; fetchedAt.value = performance.now(); clock.value = fetchedAt.value;
+      // Keep the snapshot even while the shell is closed: a payload that lands
+      // in the window between "capture started" and "overlay shown" used to be
+      // dropped, and the overlay then waited for the next buff/debuff change.
+      if (!enabled) return;
       syncOverlayDomWork();
       if (wasActive && !nextActive && props.view === "status") {
         void closeAfterCaptureStop();
@@ -473,6 +552,7 @@ export function useBuffOverlay(props: BuffOverlayProps) {
     setOverlayEnabled(next);
   }
   function setOverlayEnabled(next: boolean) {
+    shellVisible.value = next;
     if (next === enabled) {
       syncOverlayDomWork();
       return;
@@ -494,11 +574,34 @@ export function useBuffOverlay(props: BuffOverlayProps) {
       captureNoticeTimer = null;
     }, duration);
   }
+  // The overlay stays on screen for the whole session, so an empty list still
+  // has to say what the window is doing. "采集中 · 暂无增益" proves the capture
+  // is alive; the whitelist variant points at the actual reason nothing shows.
+  // 空态只在没有身份行可读时解释窗口在干什么。身份行（副本/Boss）已经把
+  // 两个窗都在没有内容时显示「采集中」，让窗口常驻、能证明抓包还活着。
+  // 增益窗一旦识别到副本，就换成「副本 / Boss」两行，不再显示这句。
+  const emptyStateText = computed(() => (
+    !payload.value || captureActive.value ? "采集中" : "统计已停止"
+  ));
+  const showEmptySection = computed(() => {
+    if (!shellVisible.value || layoutMode.value || captureNotice.value) return false;
+    if (props.view === "skill") {
+      // 技能窗：进了副本就让位给两行身份；没进副本仍然显示「采集中」。
+      return !skillIdentityVisible.value && !skillCountdownRows.value.length;
+    }
+    return !statusRows.value.length;
+  });
   onMounted(() => {
-    if (browserLayoutPreviewRequested()) setLayoutMode(true);
     document.documentElement.classList.add("buff-overlay-mode"); document.body.classList.add("buff-overlay-mode");
     componentMounted = true;
-    if (props.view === 'status') void subscribeOverlayEvent<SkillCountdownSnapshot>(
+    if (browserLayoutPreviewRequested()) setLayoutMode(true);
+    // A window created for "调整位置" may finish loading after the main window
+    // stopped re-sending the event; the shared flag is always already set.
+    if (isTauri() && readOverlayLayoutMode()) setLayoutMode(true);
+    // 技能倒计时事件只属于「技能播报」窗口（view='skill'）。这里原本守的是
+    // view === 'status'，于是技能窗从不订阅、status 窗订阅了却没人用它渲染：
+    // 倒计时行恒为空。数据一直在（语音同一条流能出声），只是窗口没接上。
+    if (isSkillView.value) void subscribeOverlayEvent<SkillCountdownSnapshot>(
       OVERLAY_EVENT_TOPICS.skillCountdowns, next => {
         if (!Array.isArray(next?.rows) || !Number.isFinite(next.publishedAt)) return;
         skillSnapshot.value = next;
@@ -506,7 +609,7 @@ export function useBuffOverlay(props: BuffOverlayProps) {
         syncOverlayDomWork();
       }, windowLabel.value,
     ).then(unlisten => { if (!componentMounted) unlisten(); else skillUnlisten = unlisten; });
-    loadSettings(); enabled = expectedLocalEnabled();
+    loadSettings(); setOverlayEnabled(expectedLocalEnabled());
     syncOverlayDomWork();
     void subscribeOverlayEvent<BuffOverlayStatus>(
       OVERLAY_EVENT_TOPICS.combatSnapshot,
@@ -535,6 +638,7 @@ export function useBuffOverlay(props: BuffOverlayProps) {
       void listen<boolean>("buff-overlay-layout-mode", event => {
         setLayoutMode(Boolean(event.payload));
       }).then(unlisten => { layoutModeUnlisten = unlisten; });
+      layoutFlagUnlisten = onOverlayLayoutModeChange(enabled => setLayoutMode(enabled));
     }
     // Tauri windows receive explicit visibility/settings events. A hidden
     // on-demand WebView therefore needs no periodic JavaScript timer at all;
@@ -577,6 +681,7 @@ export function useBuffOverlay(props: BuffOverlayProps) {
     if (settingsUnlisten) settingsUnlisten();
     if (captureNoticeUnlisten) captureNoticeUnlisten();
     if (layoutModeUnlisten) layoutModeUnlisten();
+    if (layoutFlagUnlisten) { layoutFlagUnlisten(); layoutFlagUnlisten = null; }
     snapshotUnlisten?.();
     snapshotUnlisten = null;
   });
@@ -587,9 +692,11 @@ export function useBuffOverlay(props: BuffOverlayProps) {
     payload, settings, captureNotice, layoutMode, overlayShell, windowLabel,
     isStatusView, isSkillView, layoutTitle, captureActive,
     rows, buffRows, debuffRows, statusRows, standardStatusRows,
-    compactEffectRows, overlayLayout, statusListStyle, statusIconListStyle, shellStyle,
+    compactEffectRows, hiddenSelectedBuffCount, overlayLayout, statusListStyle, statusIconListStyle, shellStyle,
     rowStyle, rowWidth, remainingText, beginDrag,
     rowIconStyle, rowIconProgressStyle, rowIconLabel,
     finishLayoutMode, toggleDebuffBreakdown,
+    showEmptySection, emptyStateText,
+    skillIdentity, skillIdentityVisible,
   };
 }

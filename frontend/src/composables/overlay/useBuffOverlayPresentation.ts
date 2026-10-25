@@ -66,6 +66,8 @@ export function useBuffOverlayPresentation(context: {
   layoutMode: ReadonlyValue<boolean>;
   statusPanelGap: number;
   skillCountdownCount?: () => number;
+  /** 技能窗顶部「副本 / Boss」占几行（0 表示不显示）。 */
+  identityRowCount?: () => number;
 }) {
   const {
     props, payload: livePayload, settings, fetchedAt, clock, baseSeconds,
@@ -126,21 +128,25 @@ export function useBuffOverlayPresentation(context: {
   }
 
   function allowedModes(category: string): string[] {
-    const player = target.value;
+    // "auto" used to narrow rows to the *local* character's own attack types and
+    // elements.  Debuff rows describe what the whole party applied, and the
+    // lightweight capture profile no longer decodes damage events, so the party
+    // roster stays empty and `elements` only holds one self element.  That made
+    // "auto" hide real debuffs (减光抗 with a fire-only self).  Auto now means
+    // "trust what the backend published"; explicit modes still filter.
     if (category === "damage") {
       const mode = settings.value.damageMode;
-      return mode === "auto" ? (player?.attack_types || ["physical"]) : mode === "both" ? ["physical", "magic"] : [mode];
+      return mode === "auto" || mode === "both" ? ["physical", "magic"] : [mode];
     }
     if (category === "defense") {
       const mode = settings.value.defenseMode;
-      return mode === "auto" ? (player?.attack_types || ["physical"]) : mode === "both" ? ["physical", "magic"] : [mode];
+      return mode === "auto" || mode === "both" ? ["physical", "magic"] : [mode];
     }
     if (category === "resistance") {
       const mode = settings.value.resistanceMode;
-      const elements = player?.elements || [];
-      return mode === "auto"
-        ? elements
-        : mode === "all" ? ["fire", "water", "light", "dark"] : [mode];
+      return mode === "auto" || mode === "all"
+        ? ["fire", "water", "light", "dark"]
+        : [mode];
     }
     return [category];
   }
@@ -370,6 +376,27 @@ export function useBuffOverlayPresentation(context: {
     }));
     return result.sort((left, right) => left.sortOrder - right.sortOrder || left.name.localeCompare(right.name, "zh-CN"));
   });
+  /**
+   * Active self-Buffs that the saved whitelist hides.
+   *
+   * The empty shell explains itself with this count: "采集中 · 3 项增益未勾选"
+   * is actionable, while a bare "暂无增益" looked like a broken capture even
+   * though the packets were decoded correctly.
+   */
+  const hiddenSelectedBuffCount = computed(() => {
+    const selectedTarget = targetId.value;
+    const whitelist = new Set(settings.value.selectedBuffs);
+    if (!selectedTarget || !whitelist.size) return 0;
+    const seconds = currentSeconds.value;
+    let hidden = 0;
+    for (const raw of payload.value?.buffs || []) {
+      if (textValue(raw.target_id) !== selectedTarget) continue;
+      if (whitelist.has(textValue(raw.catalog_key))) continue;
+      if (!Boolean(raw.permanent) && numberValue(raw.end_seconds) <= seconds) continue;
+      hidden += 1;
+    }
+    return hidden;
+  });
   const buffRows = computed(() => settings.value.showBuffOverlay ? rows.value.filter(row => row.groupOrder === 0) : []);
   const debuffRows = computed(() => settings.value.showDebuffOverlay ? rows.value.filter(row => row.groupOrder > 0) : []);
   const statusRows = computed(() => rows.value.filter(row => row.groupOrder === 0 ? settings.value.showBuffOverlay : settings.value.showDebuffOverlay));
@@ -391,12 +418,16 @@ export function useBuffOverlayPresentation(context: {
   const baseOverlayLayout = computed(() => {
     if (isSkillView.value) {
       const count = context.skillCountdownCount?.() || 0;
-      const panel = skillCountdownGeometry(count || 1, settings.value.fontSize);
+      const panel = skillCountdownGeometry(
+        count,
+        settings.value.fontSize,
+        context.identityRowCount?.() || 0,
+      );
       return {
         columns: 1,
         rowsPerColumn: Math.max(1, count),
         width: 320,
-        height: Math.max(46, 12 + (count ? panel.height : panel.headerHeight)),
+        height: Math.max(46, 12 + panel.height),
       };
     }
     // Buff and Debuff share one ordered grid, allowing cross-type placement.
@@ -417,7 +448,10 @@ export function useBuffOverlayPresentation(context: {
       const base = {
         columns: Math.max(iconGrid.columns, standardColumns),
         rowsPerColumn: standardPanel.rows,
-        width: Math.max(standardWidth, iconWidth),
+        // Icon cards are ~56 px wide, so a single row used to shrink the whole
+        // window to a ~120 px sliver and the list looked like it had vanished.
+        // Keep the configured column width as the floor.
+        width: Math.max(standardWidth, iconWidth, settings.value.columnWidth),
         height: Math.max(46, 12 + standardPanel.height
           + (standardPanel.count ? STATUS_PANEL_GAP : 0) + iconHeight),
       };
@@ -538,6 +572,7 @@ export function useBuffOverlayPresentation(context: {
     currentSeconds, targetId, target, buffSourceJob, allowedModes,
     categoryEnabled, formatValue, formatRemainingSeconds, rows, buffRows,
     debuffRows, statusRows, standardStatusRows, compactEffectRows,
+    hiddenSelectedBuffCount,
     overlayLayout, statusListStyle, statusIconListStyle,
     shellStyle, rowStyle, rowWidth, remainingText,
     rowIconStyle, rowIconProgressStyle, rowIconLabel,

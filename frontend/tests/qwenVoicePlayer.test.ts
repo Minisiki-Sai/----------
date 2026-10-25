@@ -2,11 +2,14 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { QWEN_VOICES, qwenVoiceKey, announcementParts, QwenVoicePlayer } from '../src/utils/qwenVoicePlayer.ts';
 
-test('four genuine Qwen speaker keys, migrate native preferences', () => {
-  assert.deepEqual(QWEN_VOICES.map(v => v.key), ['Vivian', 'Serena', 'Uncle_Fu', 'Dylan']);
+test('bundled Qwen speaker keys, migrate native preferences', () => {
+  const keys = QWEN_VOICES.map(v => v.key);
+  assert.deepEqual(keys, ['Vivi2', 'Xiaohe', 'Vivian', 'Serena']);
+  for (const key of keys) assert.equal(qwenVoiceKey(key), key, `${key} must not fall back`);
   assert.equal(qwenVoiceKey('Microsoft Huihui'), 'Vivian');
   assert.equal(qwenVoiceKey(''), 'Vivian');
-  assert.equal(qwenVoiceKey('Dylan'), 'Dylan');
+  assert.equal(qwenVoiceKey('Uncle_Fu'), 'Vivian', 'removed speaker falls back');
+  assert.equal(qwenVoiceKey('Dylan'), 'Vivian', 'removed speaker falls back');
 });
 
 test('stop cancels pending load; warm cache plays without network; no backlog', async () => {

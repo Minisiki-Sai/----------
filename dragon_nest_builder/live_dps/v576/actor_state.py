@@ -1549,10 +1549,54 @@ class V576ActorStateMixin:
         if template is None:
             return "", ""
         level_label = f"Lv{template.level}" if template.level else ""
-        target_kind = "Boss" if template.boss else ""
+        target_kind = "Boss" if self._is_boss_actor(actor_id) else ""
         return template.name, " ".join(
             value for value in (target_kind, level_label) if value
         )
+    def _is_boss_actor(self, actor_id: int | None) -> bool:
+        """这个 actor 算不算这场战斗的主 Boss。
+
+        客户端怪物表不是权威：阶段体（红龙佩达 503681/503682、沙漠龙扎卡德
+        4150050/4160001、沙虫哈扎尔 4150065）在表里都是 ``boss=False``，只有
+        终局形态标了 boss。可它们就是这一关的 Boss —— 只按 ``template.boss``
+        判定，这些 actor 的技能/动作/状态证据会在生成事件那一步被整段丢掉，
+        表现就是「血量行有、机制提示和倒计时一条都没有」。
+
+        ``boss_actor_ids`` 才是权威集合：它在绑定时除了 ``template.boss``，
+        还认「固定血量档案登记过的名字」和副本 Boss 模板集合
+        （见 ``bootstrap_boss_entities`` / ``_observe_monster_spawn``）。
+        """
+        if actor_id is None:
+            return False
+        if actor_id in self.boss_actor_ids:
+            return True
+        template = self.monster_entities.get(actor_id)
+        return bool(template is not None and template.boss)
+    def note_skill_drop(self, reason: str, actor_id: int | None, skill: object) -> None:
+        """记一条「解出来了但没进事件」的 Boss 技能。
+
+        只累加计数，不做 I/O，所以回放和实机都能常开。抓包回放测试用
+        ``skill_drop_counts`` 做守恒断言：一个都不该有。
+        """
+        counts = getattr(self, "skill_drop_counts", None)
+        if counts is None:
+            counts = self.skill_drop_counts = {}
+        counts[reason] = counts.get(reason, 0) + 1
+        samples = getattr(self, "skill_drop_samples", None)
+        if samples is None:
+            samples = self.skill_drop_samples = []
+        if len(samples) < 32:
+            try:
+                actor_text = f"0x{int(actor_id or 0):08X}"
+            except (TypeError, ValueError):
+                actor_text = str(actor_id)
+            try:
+                skill_text = int(skill or 0)
+            except (TypeError, ValueError):
+                skill_text = 0
+            samples.append(
+                {"reason": reason, "actor": actor_text, "skill": skill_text}
+            )
     def _monster_event_id(self, actor_id: int | None) -> str:
         if actor_id is None:
             return ""

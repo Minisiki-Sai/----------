@@ -295,10 +295,55 @@ BACKEND_API_CAPABILITIES = frozenset(
     }
 )
 
-from dragon_nest_builder.calculator import BuildCalculator
-from dragon_nest_builder.data_loader import DataStore, as_number
-from dragon_nest_builder.live_dps import npcap_config
-from dragon_nest_builder.v410_native_core import NativeSimulatorCore
+from dragon_nest_builder import npcap_config
+
+# 开发者模式「回放实战录像」的后台作业。解码一次几十秒，放在后台线程里跑，
+# 前端轮询进度，避免请求线程被卡住看起来像死机。
+_REPLAY_JOBS: Any | None = None
+_REPLAY_JOBS_LOCK = threading.Lock()
+
+
+def _replay_jobs() -> Any:
+    global _REPLAY_JOBS
+    with _REPLAY_JOBS_LOCK:
+        if _REPLAY_JOBS is None:
+            from dragon_nest_builder.live_dps.replay_jobs import ReplayJobManager
+
+            _REPLAY_JOBS = ReplayJobManager(Path(__file__).resolve().parent / "dragon_nest_builder" / "data")
+        return _REPLAY_JOBS
+
+
+def _replay_capture_roots() -> list[Path]:
+    """能从哪里挑录像：工具自己的录制目录优先，再兜一层用户目录。"""
+
+    from dragon_nest_builder.live_dps import debug_recording
+
+    roots = [debug_recording.effective_output_dir()]
+    roots.append(Path.home() / "Documents" / "DragonNestDpsCapture" / "debug_records")
+    return [path for path in roots if path.is_dir()]
+
+
+# The capture core pulls in the protocol catalogs and the whole ``live_dps``
+# package (a couple of seconds of imports). Import it inside the warm-up
+# thread instead of at module scope so the HTTP socket is listening - and the
+# desktop window usable - within a few hundred milliseconds of launch.
+
+
+def _engine_classes():
+    from dragon_nest_builder.calculator import BuildCalculator
+    from dragon_nest_builder.data_loader import DataStore
+    from dragon_nest_builder.v410_native_core import NativeSimulatorCore
+
+    return BuildCalculator, DataStore, NativeSimulatorCore
+
+
+def as_number(value, default: float = 0.0) -> float:
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 HOST = "127.0.0.1"
@@ -531,6 +576,7 @@ class Engine:
         # The capture core needs the data store and a calculator instance for
         # protocol catalogs and profile labels; no HTTP route exposes build
         # calculation any more.
+        BuildCalculator, DataStore, NativeSimulatorCore = _engine_classes()
         self.store = DataStore.load()
         self.calculator = BuildCalculator(self.store)
         self.native = NativeSimulatorCore(self.store, self.calculator)
@@ -546,11 +592,29 @@ class Engine:
 ENGINE: Engine | None = None
 
 
+_ENGINE_LOCK = threading.Lock()
+_ENGINE_READY = threading.Event()
+
+
 def get_engine() -> Engine:
+    """Build the capture engine at most once, even under concurrent requests."""
     global ENGINE
-    if ENGINE is None:
-        ENGINE = Engine()
+    if ENGINE is not None:
+        return ENGINE
+    with _ENGINE_LOCK:
+        if ENGINE is None:
+            t0 = time.perf_counter()
+            ENGINE = Engine()
+            _ENGINE_READY.set()
+            print(
+                f"Engine ready in {time.perf_counter() - t0:.2f}s",
+                flush=True,
+            )
     return ENGINE
+
+
+def engine_ready() -> bool:
+    return _ENGINE_READY.is_set() and ENGINE is not None
 
 
 class ApiHandler(BaseHTTPRequestHandler):
@@ -621,11 +685,14 @@ class ApiHandler(BaseHTTPRequestHandler):
         try:
             parsed = urlparse(self.path)
             query = parse_qs(parsed.query)
-            core = get_engine().native
+            # Health answers immediately: the engine still needs a few seconds
+            # to load its protocol catalogs, and the window must not look dead
+            # while that happens.
             if parsed.path == "/api/health":
                 self._write_json(
                     {
                         "ok": True,
+                        "ready": engine_ready(),
                         "product": BACKEND_PRODUCT,
                         "version": VERSION,
                         "apiRevision": BACKEND_API_REVISION,
@@ -634,12 +701,31 @@ class ApiHandler(BaseHTTPRequestHandler):
                     }
                 )
                 return
+            core = get_engine().native
             if parsed.path == "/api/capture/status":
+                if not engine_ready():
+                    # Never park the request behind the engine warm-up: the
+                    # window polls this every second and must stay responsive.
+                    self._write_json(
+                        {
+                            "state": "starting",
+                            "status": "正在初始化解析核心…",
+                            "autoEnabled": False,
+                        }
+                    )
+                    return
                 include_snapshot = query.get("includeSnapshot", ["1"])[0] != "0"
                 self._write_json(core.capture_status(include_snapshot))
                 return
             if parsed.path == "/api/capture/voice-events":
                 self._write_json(core.capture_voice_events())
+                return
+            if parsed.path == "/api/replay/captures":
+                self._write_json(_replay_jobs().captures(*_replay_capture_roots()))
+                return
+            if parsed.path == "/api/replay/status":
+                job = (query.get("job") or [""])[0]
+                self._write_json(_replay_jobs().status(job))
                 return
             if parsed.path == "/api/capture/timeline":
                 try:
@@ -672,7 +758,30 @@ class ApiHandler(BaseHTTPRequestHandler):
                 )
                 return
             if parsed.path == "/api/capture/toggles":
+                if not engine_ready():
+                    self._write_json(
+                        {
+                            "toggles": {"buffs": True, "boss_actions": True},
+                            "labels": {
+                                "buffs": "增益 / 减益倒计时",
+                                "boss_actions": "Boss 技能 / 动作倒计时",
+                            },
+                        }
+                    )
+                    return
                 self._write_json(core.capture_toggles())
+                return
+            if parsed.path == "/api/probe":
+                # 观测日志开关：只记录事实，不影响任何统计/播报判定。
+                from dragon_nest_builder.live_dps import nest_probe
+
+                self._write_json(nest_probe.describe())
+                return
+            if parsed.path == "/api/debug-recording":
+                # 设置页「调试记录」：一个开关同时控制观测日志与保留抓包。
+                from dragon_nest_builder.live_dps import debug_recording
+
+                self._write_json(debug_recording.describe())
                 return
             if parsed.path == "/api/npcap/config":
                 self._write_json(npcap_config.status_payload())
@@ -704,6 +813,13 @@ class ApiHandler(BaseHTTPRequestHandler):
                 return
             payload = self._read_json()
             core = get_engine().native
+            if parsed_path.path == "/api/replay/open":
+                self._write_json(_replay_jobs().open(str(payload.get("path", "") or "")))
+                return
+            if parsed_path.path == "/api/debug/probe-event":
+                # 前端把「这一批事件怎么处理的」写进观测流水，回放时才能对账。
+                self._write_json(core.debug_probe_event(payload))
+                return
             if self.path == "/api/npcap/config":
                 raw = str(payload.get("path", "") or "")
                 npcap_config.write_config_path(raw)
@@ -730,7 +846,38 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self._write_json(npcap_config.test_connection())
                 return
             if self.path == "/api/capture/start":
+                from dragon_nest_builder.live_dps import nest_probe
+
+                # 每次「开始统计」换一个新文件：一轮副本一个日志，便于事后对齐。
+                nest_probe.rotate()
                 self._write_json(core.start_capture(as_number(payload.get("duration"))))
+                return
+            if self.path == "/api/debug-recording":
+                from dragon_nest_builder.live_dps import debug_recording
+
+                enabled = payload.get("enabled")
+                output_dir = payload.get("outputDir")
+                try:
+                    self._write_json(
+                        debug_recording.apply(
+                            enabled=None if enabled is None else bool(enabled),
+                            output_dir=None if output_dir is None else str(output_dir),
+                        )
+                    )
+                except ValueError as error:
+                    state = debug_recording.describe()
+                    state["error"] = str(error)
+                    state["message"] = str(error)
+                    self._write_json(state, HTTPStatus.BAD_REQUEST)
+                return
+            if self.path == "/api/probe":
+                from dragon_nest_builder.live_dps import nest_probe
+
+                if payload.get("enabled") is None:
+                    self._write_json(nest_probe.describe())
+                    return
+                nest_probe.set_runtime_enabled(bool(payload.get("enabled")))
+                self._write_json(nest_probe.describe())
                 return
             if self.path == "/api/capture/stop":
                 self._write_json(core.stop_capture())
@@ -749,9 +896,30 @@ def serve(host: str = HOST, port: int = DEFAULT_PORT) -> None:
     # Native extensions imported during startup may replace the process-wide
     # exception filter. Install ours once more after all backend modules loaded.
     _install_windows_backend_minidump()
+    # 「调试记录」开关要在第一次抓包之前就生效，否则上一轮保存的开关得等界面
+    # 拉一次状态才起作用（中途开关会让头一份文件落在旧目录）。
+    try:
+        from dragon_nest_builder.live_dps import debug_recording
+
+        debug_recording.ensure_applied()
+    except Exception:
+        pass
     server = _bind_server_or_wait_for_takeover(host, port)
-    engine = get_engine()
-    _start_backend_state_heartbeat(engine)
+    # Load the engine off the request path so /api/health answers in
+    # milliseconds and the window becomes usable immediately.
+    threading.Thread(
+        target=get_engine, name="v420-engine-warmup", daemon=True
+    ).start()
+
+    def heartbeat_when_ready() -> None:
+        if _ENGINE_READY.wait(120.0):
+            engine = ENGINE
+            if engine is not None:
+                _start_backend_state_heartbeat(engine)
+
+    threading.Thread(
+        target=heartbeat_when_ready, name="v420-heartbeat-start", daemon=True
+    ).start()
     pid_path = Path(__file__).resolve().parent / ".v420_backend_pid"
     pid_path.write_text(str(os.getpid()), encoding="ascii")
     _write_backend_diagnostic(

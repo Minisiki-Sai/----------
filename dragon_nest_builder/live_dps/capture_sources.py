@@ -163,6 +163,7 @@ class V576DiagnosticReplaySource:
         cancel_check: Callable[[], bool] | None = None,
         action_parser_mode: str | None = None,
         duplicate_hit_evidence: bool = True,
+        voice_feed: bool = False,
     ) -> None:
         # MovementLedger stays independent from combat attribution, but the
         # replay reader has already paid for frame I/O and transport
@@ -237,6 +238,15 @@ class V576DiagnosticReplaySource:
             3,
         )
         self._decoder = decoder
+        # 语音证据：实时源（V576NpcapSource）在建立解码器后必接这一句，回放源
+        # 以前没接，于是「回放录像」永远产不出语音证据行。默认仍然不接
+        # （DPS 回放不需要，接了只是白算），需要的人显式要。
+        self.voice_signal_feed = None
+        if voice_feed:
+            from .voice_signals import VoiceSignalFeed
+
+            self.voice_signal_feed = VoiceSignalFeed()
+            decoder.voice_signal_feed = self.voice_signal_feed
         self._events: list[LiveDpsEvent] | None = None
         self.total_event_count = 0
         self.debuff_evidence_stats: dict[str, int | bool] = {}
@@ -1599,10 +1609,14 @@ class V576AutoCaptureProbe:
         discover_tcp: bool | None = None,
         known_actor_names: dict[int, str] | None = None,
         identity_only: bool = False,
+        entity_only: bool = False,
         prebattle_udp: bool = False,
         arm_tcp_discovery_on_start: bool = True,
     ) -> None:
         self._identity_only = bool(identity_only)
+        # 只建实体档案：完整解码（否则 monster_entities 建不起来），但不保留
+        # 原始帧、不聚合、不落盘。正式采集会用导出的实体表接上。
+        self._entity_only = bool(entity_only)
         self._prebattle_udp = bool(prebattle_udp)
         self._stream = NpcapPacketStream(
             udp_ports,
@@ -1623,7 +1637,7 @@ class V576AutoCaptureProbe:
         # Keeping the combat-sized 262k ledger caused avoidable long-session
         # memory pressure; transport reassembly already handles TCP retries.
         self._ledger = V576EventLedger(
-            max_events=8_192 if self._identity_only else 262_144
+            max_events=8_192 if (self._identity_only or self._entity_only) else 262_144
         )
         self._transport = V576TransportReassembler(
             # Identity/profile records are only a few KiB.  The combat-sized
@@ -1633,8 +1647,13 @@ class V576AutoCaptureProbe:
             # gradually reached 10--20 seconds.  Keep a generous 512 KiB
             # identity window and retire sockets that have been silent for a
             # minute; normal combat/replay transports remain unchanged.
-            max_buffer_bytes=(512 * 1024 if self._identity_only else 4 * 1024 * 1024),
-            flow_retention_seconds=(60.0 if self._identity_only else None),
+            max_buffer_bytes=(
+                512 * 1024 if (self._identity_only or self._entity_only)
+                else 4 * 1024 * 1024
+            ),
+            flow_retention_seconds=(
+                60.0 if (self._identity_only or self._entity_only) else None
+            ),
         )
         self._port_provider = port_provider
         self._discover_udp = (
@@ -1765,6 +1784,25 @@ class V576AutoCaptureProbe:
         triggers.put(normalized)
         self._hold_accelerator_tcp_discovery(duration)
 
+    def export_monster_entities(self) -> dict[int, int]:
+        """actor_id -> 模板号（只导 Boss）。
+
+        正式采集新建 decoder 时用它把实体验回来，这样「进本后才开统计」也能
+        立刻认出 Boss、出技能事件。
+        """
+
+        entities = getattr(self._decoder, "monster_entities", None)
+        if not isinstance(entities, dict):
+            return {}
+        seeds: dict[int, int] = {}
+        for actor_id, template in list(entities.items())[-512:]:
+            if not getattr(template, "boss", False):
+                continue
+            template_id = int(getattr(template, "template_id", 0) or 0)
+            if template_id > 0:
+                seeds[int(actor_id)] = template_id
+        return seeds
+
     def poll_identity_discovery_triggers(self) -> list[str]:
         triggers: list[str] = []
         while True:
@@ -1862,7 +1900,9 @@ class V576AutoCaptureProbe:
     def _decode(self, frames: list[tuple[float, bytes, int, int]]) -> str:
         self._reset_paused_prebattle_sources()
         for raw_frame in frames:
-            if not bool(getattr(self, "_identity_only", False)):
+            if not bool(getattr(self, "_identity_only", False)) and not bool(
+                getattr(self, "_entity_only", False)
+            ):
                 self._remember(raw_frame)
             timestamp, frame, original_length, _adapter_index = raw_frame
             packet = decode_captured_frame(timestamp, frame, original_length)
@@ -2530,6 +2570,8 @@ class V576NpcapSource:
         prebattle_state: dict[str, object] | None = None,
         prebattle_tracker: PrebattleStateTracker | None = None,
         toggles: Any | None = None,
+        attack_target_sink: Callable[[str, str, int], None] | None = None,
+        seed_monster_entities: dict[int, int] | None = None,
     ) -> None:
         # The countdown build keeps no capture history: the raw trace is a
         # short-lived working file under %TEMP% and is deleted when the source
@@ -2588,6 +2630,13 @@ class V576NpcapSource:
         )
         self._prebattle_tracker = prebattle_tracker
         self._toggles = toggles
+        if seed_monster_entities:
+            # 待机探针收集的 Boss 实体档案：进本后才开统计时靠它把实体接上。
+            self._decoder.seed_monster_entities(seed_monster_entities)
+        # 分边副本靠「本机最后一次攻击的目标」判断我在打哪只 Boss，而这个
+        # 信息只存在于伤害事件里。轻量版不把伤害事件交给聚合器（不做 DPS），
+        # 所以单独留一个只记账的旁路，见 _publish_events。
+        self._attack_target_sink = attack_target_sink
         from .voice_signals import VoiceSignalFeed
         self._decoder.voice_signal_feed = VoiceSignalFeed()
         prebattle_events: list[LiveDpsEvent] = []
@@ -2938,9 +2987,33 @@ class V576NpcapSource:
         tracker = getattr(self, "_prebattle_tracker", None)
         origin = getattr(self._decoder, "first_timestamp", None) if tracker is not None else None
         toggles = getattr(self, "_toggles", None)
-        from .capture_toggles import should_capture
+        sink = getattr(self, "_attack_target_sink", None)
+        from .capture_toggles import should_publish
         for event in events:
-            if toggles is not None and not should_capture(toggles, event):
+            # 伤害事件不进聚合器（轻量版不做 DPS/曲线），但「某玩家最后一次打的是谁」
+            # 是分边副本识别「我在打朱武还是卡基夫」的唯一依据。这里只记一条目标，
+            # 不累计伤害、不建曲线，成本是一次 dict 写。
+            if isinstance(event, CombatEvent):
+                if sink is not None and getattr(event, "target_id", "") and getattr(event, "amount", 0) > 0:
+                    # 名字也要带出去：轻量版没有血量行，「Boss:」这一行的名字
+                    # 只能靠伤害事件里的 target_name。
+                    try:
+                        sink(
+                            event.source_id,
+                            event.target_id,
+                            event.timestamp_ms,
+                            getattr(event, "target_name", ""),
+                            # 伤重量：白名单要选「15 秒内主要打谁」，只靠
+                            # 「最后命中」会被 AOE 的末位单位带偏。
+                            float(getattr(event, "amount", 0) or 0),
+                        )
+                    except TypeError:
+                        sink(event.source_id, event.target_id, event.timestamp_ms)
+                continue
+            # 只按事件类别裁剪（本轻量版只保留 buff / Boss 技能两类），并尊重首页
+            # 两个总开关：关掉就停止该类事件的聚合与推送。解码本身停不了——语音
+            # 走解码器里独立的 voice_signal_feed，关掉悬浮窗后仍要照常播报。
+            if not should_publish(event, toggles):
                 continue
             if origin is not None and isinstance(event, (BossStatusEvent, PlayerLifecycleEvent, PlayerHealthEvent, BossActionEvent)):
                 tracker.observe((event,), float(origin) + event.timestamp_ms / 1000.0)
@@ -3315,20 +3388,43 @@ class V576NpcapSource:
         self._discard_working_trace()
 
     def _discard_working_trace(self) -> None:
-        """Remove the temporary raw trace; this build keeps no capture history."""
+        """本轮抓包的收尾。
 
-        for path in (getattr(self, "diagnostic_trace_path", None),):
-            if not path:
-                continue
-            try:
-                Path(path).unlink(missing_ok=True)
-            except OSError:
-                pass
-            try:
-                remove_dpscap_segments(Path(path))
-            except OSError:
-                pass
+        默认（「调试记录」开关关闭）行为与以前一致：临时抓包直接从 %TEMP% 删除，
+        不留任何历史。开关打开时改为移动到保存目录，便于事后按同一份数据反复
+        离线复算，而不必让玩家重打一遍副本。
+        """
+
+        path = getattr(self, "diagnostic_trace_path", None)
+        if not path:
+            return
+        if self._retain_working_trace(Path(path)):
             self.diagnostic_trace_path = None
+            return
+        try:
+            Path(path).unlink(missing_ok=True)
+        except OSError:
+            pass
+        try:
+            remove_dpscap_segments(Path(path))
+        except OSError:
+            pass
+        self.diagnostic_trace_path = None
+
+    @staticmethod
+    def _retain_working_trace(path: Path) -> bool:
+        """按「调试记录」开关决定是否保留抓包；任何异常都回退到删除。"""
+
+        try:
+            from . import debug_recording
+        except Exception:
+            return False
+        try:
+            if not debug_recording.keep_capture_enabled():
+                return False
+            return debug_recording.retain_capture(path)
+        except Exception:
+            return False
 
     def capture_clock_sample(self) -> tuple[int, float]:
         """Return raw-frame revision and seconds from the session boundary.

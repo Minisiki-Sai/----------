@@ -165,3 +165,52 @@ test('countdowns own an independent window without Buff/Debuff, in either mode',
   }
   assert.equal(normalizeBuffOverlaySettings({}).showSkillCountdownOverlay, true);
 });
+
+test('silent-past-zero boss is forgotten so ready rows stop lingering', () => {
+  // 梦魇海龙实测：审判者天启最后一条血量停在 0.017%，服务器不再发 0，
+  // 于是它的「六芒星/旋转…已好」会一直挂在终局阶段。retiredBossIds 到位后
+  // 必须一次性清掉，且不会再被重新计时。
+  const tracker = new SkillCountdownTracker();
+  tracker.observe([
+    { source: 'apocalypse', skill: 50411, templateId: 4235447, timestamp: 0 },
+    { source: 'dragon', skill: 325447, templateId: 4237034, timestamp: 0 },
+  ], '梦魇海龙');
+  assert.equal(tracker.countdowns(100_000, ['sea-apocalypse-star', 'sea-ice-eye']).length, 2);
+  tracker.forgetSources(['apocalypse'], true);
+  assert.deepEqual(
+    tracker.countdowns(100_000, ['sea-apocalypse-star', 'sea-ice-eye']).map(row => row.ruleKey),
+    ['sea-ice-eye'],
+  );
+  // 已离场的来源即使再收到旧事件也不能复活。
+  tracker.observe([{ source: 'apocalypse', skill: 50411, templateId: 4235447, timestamp: 101_000 }], '梦魇海龙');
+  assert.deepEqual(
+    tracker.countdowns(102_000, ['sea-apocalypse-star']),
+    [],
+  );
+});
+
+test('switching sides drops the countdowns of the boss just left', () => {
+  // 换边后旧侧已经起好的倒计时必须丢掉，否则「已好」会在到点时继续播报
+  // （用户看到的就是「我换到狮蝎了，天启的技能还在提示」）。
+  const tracker = new SkillCountdownTracker();
+  tracker.observe([{ source: 'apocalypse', skill: 50411, templateId: 4235447, timestamp: 0 }], '梦魇海龙');
+  assert.equal(tracker.countdowns(1000, ['sea-apocalypse-star']).length, 1);
+  tracker.forgetTemplates([4235447]);
+  assert.deepEqual(tracker.countdowns(2000, ['sea-apocalypse-star']), []);
+  // 切回来重新放技能可以再次计时（不标记已死）。间隔要超过 10 秒去重窗口。
+  tracker.observe([{ source: 'apocalypse', skill: 50411, templateId: 4235447, timestamp: 12_000 }], '梦魇海龙');
+  assert.equal(tracker.countdowns(13_000, ['sea-apocalypse-star']).length, 1);
+});
+
+test('sea reminder clock forgets sources and templates independently', () => {
+  const clock = new SeaReminderClock('cooldown');
+  clock.started(325447, 0, 'dragon', 4237034);
+  clock.started(50411, 0, 'apocalypse', 4235447);
+  assert.equal(clock.countdowns(1000).length, 2);
+  clock.forgetTemplates([4235447]);
+  assert.deepEqual(clock.countdowns(1000).map(row => row.label), ['海龙 · 冰眼']);
+  clock.forgetSources(['dragon'], true);
+  assert.deepEqual(clock.countdowns(1000), []);
+  clock.started(325447, 2000, 'dragon', 4237034);
+  assert.deepEqual(clock.countdowns(3000), []);
+});

@@ -13,7 +13,7 @@ from pathlib import Path
 
 from .bounded_queue import AsyncSpillQueue
 from .trace_writer import AsyncTraceWriter
-from . import npcap_config
+from .. import npcap_config
 from . import capture_health
 
 

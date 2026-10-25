@@ -27,6 +27,15 @@ export class SkillCountdownTracker {
   private other = new NestSkillCooldownClock();
   private nest = '';
   clear() { this.reminders.clear(); this.recent.clear(); this.other.clear(); this.nest=''; }
+  /** Boss 离场：丢掉它的倒计时并标记已死，避免「已好」一直挂着。 */
+  forgetSources(sources: readonly string[], markDead = true) {
+    this.reminders.forgetSources(sources, markDead);
+  }
+  /** 换边：丢掉刚离开那一侧 Boss 的倒计时。 */
+  forgetTemplates(templates: readonly number[]) {
+    this.reminders.forgetTemplates(templates);
+    this.other.forgetTemplates(templates);
+  }
   observe(rows: CountdownEvent[], nest: string) {
     const key=countdownNest(nest);
     if(key!==this.nest){this.clear();this.nest=key;}
@@ -58,11 +67,15 @@ export class SkillCountdownTracker {
 
 // Keep these dimensions shared with the rendered panel; native window sizing
 // must include this panel even when Buff/Debuff have no rows at all.
-export function skillCountdownGeometry(count: number, fontSize: number) {
+// `identityRows` 计入窗口顶部的「副本 / Boss」两行身份信息。
+export function skillCountdownGeometry(count: number, fontSize: number, identityRows = 0) {
   const rowHeight = Math.ceil(fontSize * 1.55) + 14;
   const headerHeight = Math.ceil(fontSize * 1.55);
-  return { rowHeight, headerHeight,
-    height: count > 0 ? 16 + headerHeight + 6 + count * (rowHeight + 4) + 4 : 0 };
+  const identityHeight = identityRows > 0
+    ? identityRows * (Math.ceil(fontSize * 1.45) + 2) + 6
+    : 0;
+  return { rowHeight, headerHeight, identityHeight,
+    height: 16 + identityHeight + (count > 0 ? headerHeight + 6 + count * (rowHeight + 4) + 4 : 0) };
 }
 
 // Never leave a frozen timer visible when the main window/backend stops updating.

@@ -14,6 +14,10 @@ import { LiveReminderTime } from '../utils/liveReminderTime';
 import { simulatorApi } from '../services/api';
 import { immediateMechanicText, hpAnnouncement, seaMechanicKey, voiceModes, classicAddAnnouncement } from '../utils/voiceAnnouncements';
 import { VOICE_KEY, VOICE_RULES, normalizeVoiceSettings, voiceRule, seaBreathText, seaMechanicText, SeaReminderClock, monsterAppearanceText } from '../utils/voiceAnnouncements';
+import { countdownNest } from '../utils/nestSkillCooldowns';
+import { VoiceBatchEngine, type VoiceBatchResult } from '../utils/voiceBatchEngine';
+import { filterCurrentGroupRows, focusTemplates, leavingFocus, readSplitGroupHint } from '../utils/splitBossScope';
+import { captureToggleAllows } from '../utils/captureToggles';
 const props = defineProps<{ running: boolean; nest: string; live: boolean }>();
 const open = ref(false);
 const message = ref('');
@@ -66,14 +70,12 @@ function speak(text: string | string[], preview = false) {
   void player.play(texts, settings.value.voice, settings.value.volume, preview)
     .catch(e => { message.value = `语音播放失败：${e.message || e}`; });
 }
-let session = '', sequence = 0, busy = false, generation = 0;
-const recent = new Map<string, number>();
-const reminders = new SeaReminderClock();
-const shadowClock = new ShadowExplosionClock();
-const classicClock = new ClassicMechanics();
-const hardClock = new HardMechanics();
-const sandClock = new SandMechanics();
-const visualClock = new SkillCountdownTracker();
+let busy = false, generation = 0;
+// 决策逻辑（时钟、去重、门控）都在 VoiceBatchEngine 里，和抓包回放测试共用
+// 同一份代码 —— 页面这边只剩 I/O：拉事件、出声、推悬浮窗、写观测。
+const engine = new VoiceBatchEngine();
+const visualClock = engine.visualClock;
+const reminders = engine.reminders;
 const reminderTime = new LiveReminderTime();
 let clockRunning = false;
 let visualSettings = readBuffOverlaySettings(), visualSettingsRaw: string | null = null;
@@ -86,153 +88,154 @@ let countdownPublishedAt = 0, countdownSignature = '';
 function publishCountdowns(rows: SkillCountdown[], force = false) {
   const now = Date.now(), signature = rows.map(row => row.key).join('|');
   if (!force && signature === countdownSignature && (!rows.length || now - countdownPublishedAt < 250)) return;
+  const changed = signature !== countdownSignature;
   countdownPublishedAt = now; countdownSignature = signature;
   void publishOverlayEvent(OVERLAY_EVENT_TOPICS.skillCountdowns, { rows, publishedAt: now }, ['skill-countdown-overlay']).catch(() => {});
+  // 行集合一变就记一条：悬浮窗「倒计时几秒后消失」只能靠这个还原。
+  if (changed) {
+    void simulatorApi
+      .probeEvent('frontend_countdowns', {
+        count: rows.length,
+        // 带上满时长：只有 `left` 时，分不清「走完了」和「被清空/重置了」。
+        rows: rows.slice(0, 10).map(row => ({
+          k: row.ruleKey,
+          left: Math.round(row.remainingMs / 1000),
+          dur: Math.round(row.durationMs / 1000),
+          ready: row.ready === true,
+        })),
+      })
+      .catch(() => undefined);
+  }
 }
-function reset() { generation++; session = ''; sequence = 0; clockRunning = false; reminderTime.clear(); recent.clear(); reminders.clear(); shadowClock.clear(); classicClock.clear(); hardClock.clear(); sandClock.clear(); visualClock.clear(); publishCountdowns([], true); player.stop(); }
+function reset() {
+  generation++;
+  clockRunning = false;
+  reminderTime.clear();
+  engine.reset();
+  publishCountdowns([], true);
+  player.stop();
+}
 watch(settings, () => {
   try { localStorage.setItem(VOICE_KEY, JSON.stringify(settings.value)); } catch { message.value = '配置保存失败，存储空间不可用。'; }
+  reportSettingsSnapshot('change');
   if (countdownSettings().showSkillCountdownOverlay) {
-    // Changing/muting audio must not erase independently running visual timers.
-    generation++; recent.clear(); reminders.clear(); shadowClock.clear(); classicClock.clear(); hardClock.clear(); sandClock.clear(); player.stop();
+    // 改音量/静音不能把独立运行的悬浮窗倒计时一起抹掉。
+    generation++;
+    engine.clearForAudioChange();
+    player.stop();
   } else reset();
 }, { deep: true });
 watch(() => settings.value.voice, warmVoice);
 watch(() => [props.running, props.live, props.nest], reset);
+/* 观测：每 ~6 秒把这一批的处理结果写一条到观测流水。
+   只读状态、不改任何播报行为。用来判断是「没收到行」还是「收到被哪个门丢了」。 */
+let traceTick = 0;
+function reportTrace(
+  data: { state?: string; clockRunning?: boolean; elapsedSeconds?: number; sessionId?: string; retiredBossIds?: unknown },
+  rows: readonly { timestamp: number; skill: number }[],
+  result: VoiceBatchResult,
+) {
+  if (++traceTick % 40 !== 0) return;
+  // 悬浮窗开关在另一个窗口的 localStorage 里，改它不会触发上面的 watch；
+  // 顺手每 ~6 秒比对一次，保证设置快照跟得上（签名相同就不会写）。
+  reportSettingsSnapshot('change');
+  const lastTs = rows.length ? rows[rows.length - 1].timestamp : 0;
+  const fields = {
+    state: data.state,
+    clock: data.clockRunning,
+    elapsedMs: Math.round((data.elapsedSeconds || 0) * 1000),
+    lastTs,
+    driftMs: Math.round((data.elapsedSeconds || 0) * 1000) - lastTs,
+    rows: rows.length,
+    voice: result.voiceRowCount,
+    visual: result.visualRowCount,
+    staleDropped: result.staleDropped,
+    classic: result.classicTexts,
+    hard: result.hardTexts,
+    hint: result.hint
+      ? { current: result.hint.current, focus: result.hint.focus, others: result.hint.others }
+      : null,
+    // Boss 离场会把倒计时整行抹掉；不记这个，「行突然消失」永远查不到原因。
+    retired: Array.isArray(data.retiredBossIds)
+      ? (data.retiredBossIds as unknown[]).map(value => String(value)).slice(0, 8)
+      : [],
+    session: String(data.sessionId || "").slice(0, 8),
+  };
+  void simulatorApi.probeEvent("frontend_voice_batch", fields).catch(() => undefined);
+}
+
+/** 心跳（临时诊断）：即使 state/clock 异常也能留下痕迹，每 ~60 秒一条。 */
+let heartbeatTick = 0;
+function reportHeartbeat(data: { state?: string; clockRunning?: boolean; elapsedSeconds?: number; voiceEvents?: unknown[] }) {
+  if (++heartbeatTick % 400 !== 0) return;
+  void simulatorApi
+    .probeEvent("frontend_heartbeat", {
+      state: data.state,
+      clock: data.clockRunning,
+      elapsedMs: Math.round((data.elapsedSeconds || 0) * 1000),
+      rows: (data.voiceEvents || []).length,
+    })
+    .catch(() => undefined);
+}
+
 async function poll() {
   if (busy || !props.running || !props.live) return;
   const visual = countdownSettings();
-  if (!visual.showSkillCountdownOverlay) { visualClock.clear(); publishCountdowns([]); }
-  if ((!settings.value.enabled || !supported) && !visual.showSkillCountdownOverlay) return;
+  // 首页「Boss 技能 / 动作倒计时」总开关关掉后，连本地倒计时一起停：不只是
+  // 不显示窗口，而是真的不再计算（「关闭即停止解析」）。代价是重新打开要等
+  // 下一次 Boss 出招——两个抓包实测中位 ~12s、90 分位 ~53~62s、最长 ~167s。
+  // 语音播报不吃这条路径（它读同一份 voiceEvents 但只用来出声）。
+  const skillScope = captureToggleAllows('boss_actions');
+  const visualActive = skillScope && visual.showSkillCountdownOverlay;
+  if (!visualActive) { visualClock.clear(); publishCountdowns([]); }
+  if ((!settings.value.enabled || !supported) && !visualActive) return;
   busy = true; const token = generation;
   try {
     const data = await simulatorApi.captureVoiceEvents();
     if (token !== generation) return;
+    reportHeartbeat(data);
     if (data.state !== 'running' || data.clockRunning === false) { reset(); return; }
     const rows = data.voiceEvents || [];
-    const latest = Math.max(0, ...rows.map(r => r.sequence));
-    // Never replay a backlog when enabling, switching records or mounting the page.
-    if (session !== data.sessionId) {
+    // 决策全在引擎里（和抓包回放测试共用同一份代码）；这里只负责出声与推窗。
+    const result = engine.apply(data, {
+      nest: props.nest,
+      settings: settings.value,
+      visual,
+      skillScope,
+      wallClockMs: Date.now(),
+      supported,
+    });
+    if (result.reset) { reset(); return; }
+    if (result.skipped) return;
+    if (result.bootstrap) {
+      // 首包只立状态，绝不补播历史（换记录、刚打开页面时尤其明显）。
       reminderTime.clear();
-      reminderTime.observe(data.elapsedSeconds * 1000);
+      reminderTime.observe((data.elapsedSeconds || 0) * 1000);
       clockRunning = true;
-      reminders.clear(); shadowClock.clear(); classicClock.clear(); hardClock.clear(); sandClock.clear(); visualClock.clear(); session = data.sessionId; sequence = latest;
       publishCountdowns([], true);
-      // Seed HP for phase-dependent cooldowns without replaying old casts.
-      if (visual.showSkillCountdownOverlay) visualClock.observe(
-        rows.filter(row => row.kind === 'boss_hp_state' && row.hpPercent !== undefined), props.nest);
-      for (const row of rows) if (row.kind === 'boss_hp_state' && row.hpPercent !== undefined)
-        reminders.health(row.templateId || 0, row.hpPercent, row.timestamp, row.source);
-      for (const row of rows) classicClock.observe(row, props.nest, settings.value, true);
-      for (const row of rows) hardClock.observe(row, props.nest, settings.value, true);
-      for (const row of rows) sandClock.observe(row, props.nest, settings.value, true);
       return;
     }
-    reminderTime.observe(data.elapsedSeconds * 1000);
+    reminderTime.observe((data.elapsedSeconds || 0) * 1000);
     clockRunning = true;
-    const hpTexts: string[] = [];
-    const classicTexts: string[] = [];
-    const hardTexts: string[] = [];
-    const sandTexts: string[] = [];
-    for (const row of rows) if (row.sequence > sequence && row.hpPercent === 0)
-      sandClock.observe(row, props.nest, settings.value);
-    for (const row of rows) if (row.sequence > sequence && Date.now()/1000-row.observedAt<=5 && data.elapsedSeconds*1000-row.timestamp<=6000)
-      sandTexts.push(...sandClock.observe(row, props.nest, settings.value));
-    for (const row of rows) if (row.sequence > sequence && row.hpPercent === 0)
-      hardClock.observe(row, props.nest, settings.value);
-    for (const row of rows) if (row.sequence > sequence && Date.now()/1000-row.observedAt<=5 && data.elapsedSeconds*1000-row.timestamp<=6000)
-      hardTexts.push(...hardClock.observe(row, props.nest, settings.value));
-    // Clear dead actors first, even if a delayed packet batch contains a cast.
-    for (const row of rows) if (row.sequence > sequence && row.hpPercent === 0)
-      classicClock.observe(row, props.nest, settings.value);
-    for (const row of rows) if (row.sequence > sequence && Date.now()/1000-row.observedAt<=5 && data.elapsedSeconds*1000-row.timestamp<=6000)
-      classicTexts.push(...classicClock.observe(row, props.nest, settings.value));
-    if (visual.showSkillCountdownOverlay) visualClock.observe(rows.filter(row => row.sequence > sequence
-      && ((row.kind === 'boss_hp_state' && row.hpPercent === 0) || row.kind === 'boss_entity_end'
-        || (Date.now() / 1000 - row.observedAt <= 5 && data.elapsedSeconds * 1000 - row.timestamp <= 6000))), props.nest);
-    // Apply deaths before dispatching this batch: an earlier action in the same
-    // polling batch must not start audio after its source is already known dead.
-    for (const row of rows) if (row.sequence > sequence &&
-      ((row.kind === 'boss_hp_state' && row.hpPercent === 0) || row.kind === 'boss_entity_end'))
-      reminders.health(row.templateId || 0, 0, row.timestamp, row.source);
-    for (const row of rows) {
-      if (row.sequence <= sequence) continue;
-      sequence = row.sequence;
-      if (!settings.value.enabled || !supported) continue;
-      // Cleanup is authoritative even when the UI was paused and this event is old.
-      if ((row.kind === 'boss_hp_state' && row.hpPercent === 0) || row.kind === 'boss_entity_end') {
-        if (row.templateId === 4237023) shadowClock.clear();
-        reminders.health(row.templateId || 0, 0, row.timestamp, row.source);
-        continue;
-      }
-      if (Date.now() / 1000 - row.observedAt > 5 || data.elapsedSeconds * 1000 - row.timestamp > 6000) continue;
-      if (row.kind === 'monster_spawn' && row.templateId === 4237024) {
-        shadowClock.rescued(row.source, row.timestamp);
-        continue;
-      }
-      if (row.kind === 'shadow_start' && row.skill === 325478 && row.templateId === 4237025) {
-        const shadowRule = voiceRule(row.skill, props.nest, settings.value);
-        if (shadowRule && settings.value.warningSkills.includes(shadowRule.key)) shadowClock.started(row.source, row.timestamp);
-        continue;
-      }
-      if (reminders.isDead(row.source)) continue;
-      if (row.kind === 'boss_hp_state' || row.kind === 'boss_hp_threshold') {
-        if (row.hpPercent !== undefined) reminders.health(row.templateId || 0, row.hpPercent, row.timestamp, row.source);
-        if (row.kind === 'boss_hp_threshold') {
-          const text = hpAnnouncement(row.templateId || 0, row.threshold || 0, props.nest, settings.value);
-          if (text) hpTexts.push(text);
-        }
-        continue;
-      }
-      const appearanceText = monsterAppearanceText(row.kind, row.templateId, props.nest, settings.value);
-      if (appearanceText) {
-        const key = `spawn:${row.templateId}`;
-        if (row.timestamp - (recent.get(key) ?? -Infinity) < 10000) continue;
-        recent.set(key, row.timestamp);
-        speak(appearanceText);
-        continue;
-      }
-      const rule = voiceRule(row.skill, props.nest, settings.value);
-      if (!rule) continue;
-      const immediateText = immediateMechanicText(row.skill);
-      if (immediateText) {
-        const key = `${row.source}:${row.skill}`;
-        if (row.timestamp - (recent.get(key) ?? -Infinity) < 10000) continue;
-        recent.set(key, row.timestamp);
-        if (settings.value.releaseSkills.includes(rule.key)) speak(immediateText);
-        continue;
-      }
-      if (seaMechanicText(row.skill)) {
-        if (row.confirmedEndTimestamp !== undefined) {
-          reminders.ended(row.skill, row.confirmedEndTimestamp);
-          continue;
-        }
-        const key = `${row.source}:${seaMechanicKey(row.skill)}`;
-        if (row.timestamp - (recent.get(key) ?? -Infinity) < 10000) continue;
-        recent.set(key, row.timestamp);
-        if (settings.value.warningSkills.includes(rule.key)) reminders.started(row.skill, row.timestamp, row.source);
-        if (settings.value.releaseSkills.includes(rule.key)) speak(seaMechanicText(row.skill));
-        continue;
-      }
-      if (rule.key === 'sea-breath') {
-        const text = seaBreathText(row.skill, row.templateId);
-        if (!text) continue;
-        const key = `${row.source}:${row.templateId}:${row.skill}`;
-        if (row.timestamp - (recent.get(key) ?? -Infinity) < 10000) continue;
-        recent.set(key, row.timestamp);
-        if (settings.value.releaseSkills.includes(rule.key)) speak(text);
-        continue;
-      }
-      const recipients = (row.recipients || []).filter(target => {
-        const key = `${row.source}:${rule.key}:${target.id}`;
-        if (row.timestamp - (recent.get(key) ?? -Infinity) < 10000) return false;
-        recent.set(key, row.timestamp);
-        return true;
-      });
-      if (recipients.length && settings.value.releaseSkills.includes(rule.key)) speak([...new Set(recipients.map(t => t.job))].map(job => `注意${job}点名`));
-    }
-    const texts = [...new Set([...classicTexts, ...hardTexts, ...sandTexts, ...hpTexts])];
+    // 顺序与改造前一致：先播循环里逐条触发的（出现/机制/拉冰/点名），
+    // 再一次性播时钟结算出来的那批。
+    if (result.immediate.length) speak(result.immediate);
+    const texts = result.deferred;
     if (settings.value.enabled && supported && texts.length) speak(texts);
+    // 有产出就立刻记一条：每 6 秒抽样会把瞬时播报整个漏掉。
+    if (texts.length) {
+      void simulatorApi
+        .probeEvent('frontend_spoken', {
+          texts,
+          enabled: settings.value.enabled,
+          nests: settings.value.nests,
+          classicOn: settings.value.skills.includes('classic-whirlwind'),
+          classicRelease: settings.value.releaseSkills.includes('classic-whirlwind'),
+          nest: props.nest,
+        })
+        .catch(() => undefined);
+    }
+    reportTrace(data, rows, result);
     tickReminders();
   } catch { message.value = '暂时无法获取实时事件，将自动重试。'; }
   finally { busy = false; }
@@ -242,24 +245,110 @@ function tickReminders() {
   const now = reminderTime.now();
   if (now === undefined) return;
   if (settings.value.enabled && supported) {
-    const texts = [...new Set([
-      ...reminders.due(now), ...classicClock.due(now, settings.value),
-      ...hardClock.due(now, settings.value), ...sandClock.due(now, settings.value),
-      ...shadowClock.due(now),
-    ])];
-    if (texts.length) speak(texts);
+    const texts = engine.due(now, settings.value);
+    if (texts.length) {
+      speak(texts);
+      // 提醒类文本（如「旋风已好」）也立刻记一条，采样同样会漏。
+      void simulatorApi
+        .probeEvent('frontend_spoken', {
+          texts,
+          source: 'reminder',
+          enabled: settings.value.enabled,
+          nest: props.nest,
+        })
+        .catch(() => undefined);
+    }
   }
   const visual = countdownSettings();
-  publishCountdowns(visual.showSkillCountdownOverlay
-    ? visualClock.countdowns(now, visual.selectedSkillCountdowns) : []);
+  const visualActive = captureToggleAllows('boss_actions') && visual.showSkillCountdownOverlay;
+  // 总开关关掉时倒计时已经清空过，这里跟着不发布，避免把旧行再推给悬浮窗。
+  publishCountdowns(engine.countdowns(now, visual.selectedSkillCountdowns, visualActive));
+  // 悬浮窗开关是另一个窗口的 localStorage，改动不会触发上面的 watch；
+  // 这里每 tick 复算一次（值没变就是一次比较），保证开关一变就换挡。
+  syncPollRate();
 }
 let timer: number | undefined;
 let reminderTimer: number | undefined;
+let pollMs = 0;
+// 拉取 voice-events 的间隔：播报时需要 150ms 才能把播报延迟压到一帧预算内；
+// 不播报时降到 30s，避免 150ms 空转。
+const FAST_POLL_MS = 150;
+const IDLE_POLL_MS = 30_000;
+// 本地倒计时 tick 保持高频：它不产生网络请求，但决定悬浮窗秒数是否跟手。
+const CLOCK_TICK_MS = 150;
+/**
+ * 当前场景该用多高的「拉取」频率。
+ *
+ * - 不在战斗：本来就不会有播报，直接低频。
+ * - 技能倒计时悬浮窗打开时：必须高频。倒计时和播报共用一个事件流，慢轮询
+ *   批次里的技能事件会被下面 5 秒新鲜度过滤掉，结果就是「有事件但永远不显示」。
+ * - 副本没勾选白名单：语音播报会空转，同样是低频。
+ * - 定位不到副本（识别失败）：保持高频。宁可多请求几次，也不能把
+ *   「识别暂时为空」变成「播报晚 30 秒」。
+ */
+function desiredPollMs(): number {
+  if (!props.running || !props.live) return IDLE_POLL_MS;
+  const key = countdownNest(String(props.nest || '').trim());
+  if (!key) return FAST_POLL_MS;
+  if (countdownSettings().showSkillCountdownOverlay) return FAST_POLL_MS;
+  return settings.value.nests.includes(key) ? FAST_POLL_MS : IDLE_POLL_MS;
+}
+function syncPollRate() {
+  const next = desiredPollMs();
+  if (next === pollMs) return;
+  pollMs = next;
+  window.clearInterval(timer);
+  timer = window.setInterval(poll, next);
+}
+/**
+ * 记录「这一场到底开了什么」。
+ *
+ * 抓包只记网络流量，记不到玩家的开关。没有这份快照，回放就不知道当时
+ * 该不该播 —— 同一个包在不同配置下结论相反，回放等于白跑。
+ * 变了才写，一场下来通常只有一两条。
+ */
+let settingsSignature = '';
+function reportSettingsSnapshot(why: string) {
+  const voice = settings.value;
+  const visual = countdownSettings();
+  const snapshot = {
+    why,
+    enabled: voice.enabled,
+    splitBossOnly: voice.splitBossOnly,
+    nests: voice.nests,
+    skills: voice.skills,
+    releaseSkills: voice.releaseSkills,
+    warningSkills: voice.warningSkills,
+    showSkillCountdownOverlay: visual.showSkillCountdownOverlay,
+    selectedSkillCountdowns: visual.selectedSkillCountdowns,
+    splitBossOnlyCurrent: visual.splitBossOnlyCurrent,
+    bossActionsOn: captureToggleAllows('boss_actions'),
+    buffsOn: captureToggleAllows('buffs'),
+    nest: props.nest,
+  };
+  const signature = JSON.stringify({ ...snapshot, why: undefined, nest: undefined });
+  if (signature === settingsSignature && why === 'change') return;
+  settingsSignature = signature;
+  void simulatorApi.probeEvent('frontend_settings', snapshot).catch(() => undefined);
+}
+
 onMounted(() => {
   if (settings.value.enabled) warmVoice();
-  timer = window.setInterval(poll, 100);
-  reminderTimer = window.setInterval(tickReminders, 100);
+  syncPollRate();
+  reminderTimer = window.setInterval(tickReminders, CLOCK_TICK_MS);
+  reportSettingsSnapshot('mount');
 });
+// 换图、开始/停止统计、改白名单都要立刻重算，不必等下一轮低频 tick。
+watch(
+  () => [
+    props.running,
+    props.live,
+    props.nest,
+    settings.value.enabled,
+    settings.value.nests.join(','),
+  ],
+  syncPollRate,
+);
 onUnmounted(() => { reset(); window.clearInterval(timer); window.clearInterval(reminderTimer); player.dispose(); });
 </script>
 
@@ -269,7 +358,12 @@ onUnmounted(() => { reset(); window.clearInterval(timer); window.clearInterval(r
     <div v-if="open" class="voice-backdrop" @click.self="open = false" @keydown.esc="open = false">
       <section class="voice-dialog" role="dialog" aria-modal="true" aria-label="语音播报设置">
         <header><h2>语音播报</h2><button class="secondary-button" @click="open = false">关闭</button></header>
-        <label><input v-model="settings.enabled" type="checkbox" :disabled="!supported"> 开启实时语音播报</label>
+        <div class="voice-enable-row">
+          <label><input v-model="settings.enabled" type="checkbox" :disabled="!supported"> 开启实时语音播报</label>
+          <label :title="'黑龙硬核／沙龙硬核分边打两只 Boss 时，只播报自己正在打的那一只；与悬浮窗倒计时的同名开关相互独立'">
+            <input v-model="settings.splitBossOnly" type="checkbox"> 只播报当前分组 Boss 技能
+          </label>
+        </div>
         <p>配置自动保存。仅实时统计播报，历史抓包不播报。只播报已识别目标的职业，例如“注意影舞者点名”；职业未知时不猜测。同职业队员无法仅靠语音区分。不保证提前预警。</p>
         <fieldset><legend>巢穴（多选）</legend>
           <label v-for="nest in nestChoices" :key="nest.key"><input v-model="settings.nests" type="checkbox" :value="nest.key"> {{ nest.name }}</label>
@@ -309,7 +403,7 @@ onUnmounted(() => { reset(); window.clearInterval(timer); window.clearInterval(r
           </section>
         </fieldset>
         <label class="voice-field">中文音色<select v-model="settings.voice"><option v-if="!voiceChoices.length" value="">暂无中文音色</option><option v-for="v in voiceChoices" :key="v.key" :value="v.key">{{ v.label }}</option></select></label>
-        <p>四种 Qwen3-TTS 音色，默认 Vivian。提示语随程序保存，战斗中离线播放，无需 Azure 账号或安装 Windows 音色。新机制提示语需要随版本更新音频。</p>
+        <p>四种音色，默认 Vivian（Vivi2.0 与小何2.0 来自豆包 TTS，Vivian / Serena 来自 Qwen3-TTS）。提示语随程序保存，战斗中离线播放，无需 Azure 账号或安装 Windows 音色。新机制提示语需要随版本更新音频。</p>
         <details v-if="settings.nests.includes('sea-nightmare')" class="voice-mechanic-notes">
           <summary>查看播报规则</summary>
         <p>冰弹播报统一以“注意拉冰”开头。第一阶段：右向冰弹 → 注意拉冰，三连啄后前往右侧安全区；左向冰弹 → 注意拉冰，三连啄后前往左侧安全区。其他已识别阶段保留原方向规则，阶段未知不播报。按已识别的技能或已验证动作触发；阶段未知不猜测方向。</p>
@@ -341,4 +435,5 @@ onUnmounted(() => { reset(); window.clearInterval(timer); window.clearInterval(r
 .voice-boss-group{border:1px solid #d5e4e5;border-radius:10px;overflow:hidden;margin-top:10px}.voice-boss-heading{display:flex;align-items:center;gap:12px;padding:10px 12px;background:#eff7f7}.voice-boss-toggle{display:flex;align-items:center;gap:10px;flex:1;min-width:0;border:0;background:transparent;text-align:left;color:#23434b;padding:4px;cursor:pointer;font:inherit}.voice-boss-toggle:focus-visible{outline:2px solid #087f83;outline-offset:2px}.voice-count{font-size:12px;color:#46636b}.voice-group-all{display:flex;align-items:center;gap:5px;white-space:nowrap;font-size:13px}.voice-group-content{padding:0 10px}.voice-mechanic-notes{margin:14px 0;padding:10px 12px;border:1px solid #d5e4e5;border-radius:8px}.voice-mechanic-notes summary{cursor:pointer;color:#28525a;font-size:14px}
 .voice-rule{display:grid!important;grid-template-columns:minmax(170px,1fr) minmax(135px,.8fr) minmax(0,1.5fr);border-bottom:1px solid #e4eeee;padding:10px 0!important}.voice-rule:last-child{border-bottom:0}.voice-modes{display:flex;flex-wrap:wrap;gap:6px 12px;font-size:13px}.voice-modes label{display:flex;align-items:center;gap:4px}.voice-preview{display:flex;gap:8px;min-width:0}.voice-preview select{flex:1;min-width:0;width:0;color:#23434b;border:1px solid #b8cdcf;border-radius:6px;background:var(--panel-bg,#fff);text-overflow:ellipsis}.voice-preview button{flex:none;white-space:nowrap}.voice-help{margin:0 0 8px}@media(max-width:700px){.voice-rule{grid-template-columns:1fr}.voice-backdrop{padding:10px}.voice-dialog{padding:16px}}
 header,.voice-rule{display:flex;align-items:center;justify-content:space-between;gap:12px}h2{margin:0 0 16px}p{font-size:13px;line-height:1.7;color:#46636b}fieldset{border:1px solid #cadcde;border-radius:8px;margin:16px 0;padding:12px}fieldset>label{margin-right:20px}.voice-rule{padding:5px 0}.voice-field{display:flex;align-items:center;gap:16px;margin:16px 0}.voice-field select,.voice-field input{flex:1;min-width:0}select{padding:8px}
+.voice-enable-row{display:flex;flex-wrap:wrap;align-items:center;gap:8px 20px;margin:4px 0}
 </style>
