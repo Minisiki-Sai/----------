@@ -1,6 +1,0 @@
-{
-  "enabled": true,
-  "endpoint": "https://your-project-ref.supabase.co",
-  "upload_token": "replace-with-the-edge-function-upload-token",
-  "admin_password_sha256": "optional-lowercase-sha256-of-the-admin-password"
-}

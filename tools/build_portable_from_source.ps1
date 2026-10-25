@@ -55,7 +55,11 @@ if (-not $Version) {
     $Version = $match.Matches[0].Groups[1].Value
 }
 if (-not $OutDir) {
-    $OutDir = Join-Path $root 'release-portable\DN倒计时工具'
+    # 构建产物放在项目**同级**的 dnact-release\，不要写回源码树。
+    # 放在仓库里每次打包都会整目录重建（旧引擎删、新引擎写），
+    # 一次就是几百条 git 变更，把真正的代码改动埋掉。
+    $releaseParent = Split-Path -Parent $root
+    $OutDir = Join-Path $releaseParent 'dnact-release\DN倒计时工具'
 }
 Write-Output ''
 Write-Step ('Version ' + $Version)

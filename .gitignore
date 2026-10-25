@@ -57,3 +57,8 @@ user_data/
 
 # TTS 凭据（火山 AppID / Access Token），绝不提交
 tools/tts/tts_cred.json
+
+# 绿色版产物：每次打包整目录重建（旧引擎删除 + 新引擎写入），
+# 放进仓库只会让 git 多出几百条变更。打包脚本已改为输出到项目同级的
+# dnact-release/ 目录，这里再挡一层，防止历史目录被误提交。
+release-portable/
