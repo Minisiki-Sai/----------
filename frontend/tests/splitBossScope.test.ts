@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { filterCurrentGroupRows, focusTemplates, leavingFocus, readSplitGroupHint } from '../src/utils/splitBossScope.ts';
+import { filterCurrentGroupRows, focusTemplates, leavingFocus, nestScopeKey, readSplitGroupHint } from '../src/utils/splitBossScope.ts';
 import { DEFAULT_BUFF_OVERLAY_SETTINGS, normalizeBuffOverlaySettings } from '../src/utils/buffOverlaySettings.ts';
 import { normalizeVoiceSettings } from '../src/utils/voiceAnnouncements.ts';
 
@@ -129,4 +129,32 @@ test('两个开关在轮询里各自生效（语音用 splitBossOnly，倒计时
   for (const clock of ['sandClock', 'hardClock', 'classicClock']) {
     assert.match(source, new RegExp(`for \\(const row of voiceRows\\)[\\s\\S]{0,200}?this\\.${clock}\\.observe`), `${clock} 应使用 voiceRows`);
   }
+});
+
+test('同一副本的两套名字来回跳，不能当成换副本', () => {
+  // 实战实测：后端地图精确识别给「黑龙巢穴（三）」，攻击目标反推给「黑龙经典」，
+  // 每秒交替一次。以前 props.nest 直接进 watch，每跳一次 reset 一次，
+  // 倒计时刚建立就被清空、待播语音一起丢。
+  const timeline = ['黑龙巢穴（三）', '黑龙经典', '黑龙巢穴（三）', '黑龙经典', '黑龙经典', '黑龙巢穴（三）'];
+  let scope = '';
+  const changes: string[] = [];
+  for (const nest of timeline) {
+    const next = nestScopeKey(nest, scope);
+    if (next !== scope) changes.push(next);
+    scope = next;
+  }
+  assert.deepEqual(changes, ['classic'], `名字抖动不该产生多余的重置，实际变了 ${changes.length} 次`);
+});
+
+test('识别空档保持上一次的副本，不当成换副本', () => {
+  // 刚进本 / 换关瞬间会出现空名字，那时不该清掉正在跑的时钟。
+  assert.equal(nestScopeKey('', 'classic'), 'classic');
+  assert.equal(nestScopeKey('城镇', 'classic'), 'classic');
+  assert.equal(nestScopeKey('', ''), '');
+});
+
+test('真的换副本仍然要重置', () => {
+  assert.equal(nestScopeKey('黑龙巢穴（硬核）', 'classic'), 'hard');
+  assert.equal(nestScopeKey('梦魇·海龙萨芬特拉', 'hard'), 'sea-nightmare');
+  assert.equal(nestScopeKey('沙漠龙巢穴（硬核模式）', 'classic'), 'sand-hard');
 });

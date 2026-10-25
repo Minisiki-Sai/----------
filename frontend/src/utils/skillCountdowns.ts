@@ -56,6 +56,8 @@ export class SkillCountdownTracker {
       }
     }
   }
+  /** 只读诊断：认出的是哪个副本、挂着哪些计时器。 */
+  debug() { const inner = this.other.debugState(); return { nest: this.nest, timers: inner.keys, dead: inner.dead, retired: inner.retired, recent: inner.recent }; }
   countdowns(nowMs: number, selected: readonly string[]) {
     // Retain ready entries until the next cast, death, or session reset.
     const other=this.other.countdowns(nowMs).map(row=>({...row,

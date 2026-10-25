@@ -10,6 +10,7 @@
  * 用白名单而不是「另一侧黑名单」：Boss 死亡但服务器没补血量归零包时，它只是
  * 「不在 focus 里」，不需要先知道它死了。
  */
+import { countdownNest } from './nestSkillCooldowns.ts';
 
 export interface SplitGroupHint {
   current: number;
@@ -88,4 +89,19 @@ export function leavingFocus(
   if (!previous.length || !current.length) return [];
   const next = new Set(current);
   return previous.filter(template => !next.has(template));
+}
+
+/**
+ * 「换副本了吗」的判据：只看副本类别，不看显示名。
+ *
+ * 后端同一个副本有两套名字在交替（地图精确识别给「黑龙巢穴（三）」，
+ * 攻击目标反推给「黑龙经典」），于是 props.nest 每秒跳一次。如果直接拿
+ * 这个字符串当重置依据，每跳一次就把倒计时和待播语音全清掉 —— 这正是
+ * 实战里「倒计时闪一下就没、语音不播」的成因（回放的 nest 是常量，所以不复现）。
+ *
+ * 规则：映射到类别就用类别；识别空档（刚进本 / 换关瞬间）保持上一次，
+ * 不要把「暂时认不出」当成「换副本」。
+ */
+export function nestScopeKey(nest: string, previous: string): string {
+  return countdownNest(String(nest || "").trim()) || previous;
 }

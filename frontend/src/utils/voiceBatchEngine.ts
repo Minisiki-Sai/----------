@@ -467,6 +467,11 @@ export class VoiceBatchEngine {
   }
 
   /** 悬浮窗当前的倒计时行。 */
+  /** 只读诊断：倒计时这一路的内部状态，用来定位「行为什么被清空」。 */
+  debugCountdowns() {
+    return this.visualClock.debug();
+  }
+
   countdowns(nowMs: number, selected: readonly string[], visualActive: boolean): SkillCountdown[] {
     if (!visualActive) return [];
     return this.visualClock.countdowns(nowMs, selected);

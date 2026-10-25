@@ -4071,7 +4071,23 @@ class NativeLiveCapture:
                         current_nest_key = str(
                             self._state.get("nestKey") or ""
                         )
-                        if (
+                        # 地图精确识别优先于「按攻击目标反推」。
+                        # 精确值的 key 是 ``map:14514`` 这种地图级号，进不了
+                        # ``known_nest_keys()``，于是原来那句「当前 key 不认识
+                        # 就允许覆盖」每秒都成立 —— 推断值反复顶掉精确值，
+                        # nestLabel 在「黑龙巢穴（三）」和「黑龙经典」之间来回跳，
+                        # 前端把每次名字变化都当成换副本并重置所有时钟，
+                        # 表现为倒计时闪一下就没、播报丢失。
+                        current_exact = (
+                            str(self._state.get("nestConfidence") or "")
+                            == "exact_map_id"
+                            and int(self._state.get("nestMapId", 0) or 0) > 0
+                        )
+                        incoming_inferred = (
+                            str(detected_nest.get("nestConfidence") or "")
+                            == "inferred"
+                        )
+                        if (not (current_exact and incoming_inferred)) and (
                             not current_nest_key
                             # 之前是按目标反推的（confidence=inferred），
                             # 真正的场景识别一到就让它接班，反过来则不允许。

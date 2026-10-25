@@ -101,5 +101,9 @@ export class NestSkillCooldownClock {
       if(nest==='sand-hard'&&t===4150057&&e.skill===729083)this.extend(src,'sand-scorpion',e.timestamp+15000);
     }
   }
+  /** 只读诊断：挂着哪些倒计时、以及 cancel/dead/retired 的计数。
+      三者配合能把「被清空」的四种成因分开：副本名变了、总开关断了、
+      被判死亡（dead 增）、换边剔除（retired 增）。 */
+  debugState(){return {keys:[...this.timers.keys()], dead:this.dead.size, retired:this.retired.size, recent:this.recent.size};}
   countdowns(now:number){return [...this.timers].map(([key,row])=>({key,source:row.source,ruleKey:row.ruleKey,remainingMs:Math.max(0,row.deadline-now),durationMs:row.durationMs,ready:now>=row.deadline,shared:row.shared}));}
 }

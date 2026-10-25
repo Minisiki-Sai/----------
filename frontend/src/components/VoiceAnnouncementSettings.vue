@@ -15,6 +15,7 @@ import { simulatorApi } from '../services/api';
 import { immediateMechanicText, hpAnnouncement, seaMechanicKey, voiceModes, classicAddAnnouncement } from '../utils/voiceAnnouncements';
 import { VOICE_KEY, VOICE_RULES, normalizeVoiceSettings, voiceRule, seaBreathText, seaMechanicText, SeaReminderClock, monsterAppearanceText } from '../utils/voiceAnnouncements';
 import { countdownNest } from '../utils/nestSkillCooldowns';
+import { nestScopeKey } from '../utils/splitBossScope';
 import { VoiceBatchEngine, type VoiceBatchResult } from '../utils/voiceBatchEngine';
 import { filterCurrentGroupRows, focusTemplates, leavingFocus, readSplitGroupHint } from '../utils/splitBossScope';
 import { captureToggleAllows } from '../utils/captureToggles';
@@ -126,7 +127,20 @@ watch(settings, () => {
   } else reset();
 }, { deep: true });
 watch(() => settings.value.voice, warmVoice);
-watch(() => [props.running, props.live, props.nest], reset);
+/* 换副本才重置，名字变化不算。
+   后端同一个副本有两套名字在交替（地图精确识别「黑龙巢穴（三）」/ 攻击目标
+   反推「黑龙经典」），props.nest 每秒跳一次。以前直接 watch 这个字符串，
+   每跳一次就 reset 一次 —— 倒计时刚建就被清、待播语音一起丢，实战表现就是
+   「倒计时闪一下就没、语音不播」。回放的 nest 是常量，所以从不复现。
+   现在只看副本类别（classic / hard / ...），同一类别内怎么跳都不重置。 */
+let lastNestScope = "";
+function syncNestScope(): string {
+  lastNestScope = nestScopeKey(String(props.nest || ""), lastNestScope);
+  return lastNestScope;
+}
+watch(() => props.running, reset);
+watch(() => props.live, reset);
+watch(syncNestScope, reset);
 /* 观测：每 ~6 秒把这一批的处理结果写一条到观测流水。
    只读状态、不改任何播报行为。用来判断是「没收到行」还是「收到被哪个门丢了」。 */
 let traceTick = 0;
@@ -240,6 +254,37 @@ async function poll() {
   } catch { message.value = '暂时无法获取实时事件，将自动重试。'; }
   finally { busy = false; }
 }
+/* 只读诊断：倒计时行集合一变就记一条上下文。
+   实战里「行几秒就没了」有三种成因 —— 副本名算空、总开关瞬断、计时器被清，
+   只看行数分不出来，所以把当时的输入一起记下来。不参与任何判断。 */
+let countdownTraceState: { count: number; nest: string; active: boolean | null; selected: number } = {
+  count: -1, nest: '', active: null, selected: -1,
+};
+function traceCountdowns(count: number, active: boolean, selected: number) {
+  const nest = String(props.nest || '');
+  const prev = countdownTraceState;
+  if (prev.count === count && prev.nest === nest && prev.active === active && prev.selected === selected) return;
+  countdownTraceState = { count, nest, active, selected };
+  const debug = engine.debugCountdowns();
+  void simulatorApi
+    .probeEvent('frontend_countdown_trace', {
+      prevCount: prev.count,
+      count,
+      prevNest: prev.nest,
+      nest,
+      nestKey: countdownNest(nest),
+      prevActive: prev.active,
+      active,
+      selected,
+      trackerNest: debug.nest,
+      timers: debug.timers.slice(0, 8),
+      dead: debug.dead,
+      retired: debug.retired,
+      recent: debug.recent,
+    })
+    .catch(() => undefined);
+}
+
 function tickReminders() {
   if (!clockRunning || !props.running || !props.live) return;
   const now = reminderTime.now();
@@ -261,8 +306,11 @@ function tickReminders() {
   }
   const visual = countdownSettings();
   const visualActive = captureToggleAllows('boss_actions') && visual.showSkillCountdownOverlay;
+  const liveRows = engine.countdowns(now, visual.selectedSkillCountdowns, visualActive);
+  // 只读诊断，不改任何判断：行数一变就把当时的输入一起记下来。
+  traceCountdowns(liveRows.length, visualActive, visual.selectedSkillCountdowns.length);
   // 总开关关掉时倒计时已经清空过，这里跟着不发布，避免把旧行再推给悬浮窗。
-  publishCountdowns(engine.countdowns(now, visual.selectedSkillCountdowns, visualActive));
+  publishCountdowns(liveRows);
   // 悬浮窗开关是另一个窗口的 localStorage，改动不会触发上面的 watch；
   // 这里每 tick 复算一次（值没变就是一次比较），保证开关一变就换挡。
   syncPollRate();
