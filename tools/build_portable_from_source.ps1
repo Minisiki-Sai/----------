@@ -215,7 +215,16 @@ Write-Step ('Desktop: ' + $mainExe.Name + ' (' + [math]::Round($mainExe.Length /
 $outFull = [IO.Path]::GetFullPath($OutDir).TrimEnd('\')
 if ($outFull -eq [IO.Path]::GetPathRoot($outFull).TrimEnd('\')) { throw 'A concrete output folder is required.' }
 if (Test-Path -LiteralPath $outFull) {
-    if (-not $outFull.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase)) {
+    # 只允许清理两个位置：项目自己、以及项目同级的 dnact-release\。
+    # 产物放项目外是为了不污染源码仓库，但“清理”这个动作仍然不能
+    # 落到任意目录上 —— 万一 OutDir 传错，会连别人的东西一起删。
+    $releaseRoot = [IO.Path]::GetFullPath(
+        (Join-Path (Split-Path -Parent $root) 'dnact-release')
+    ).TrimEnd('\')
+    $insideProject = $outFull.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase)
+    $insideRelease = $outFull.Equals($releaseRoot, [StringComparison]::OrdinalIgnoreCase) -or
+        $outFull.StartsWith($releaseRoot + '\', [StringComparison]::OrdinalIgnoreCase)
+    if (-not ($insideProject -or $insideRelease)) {
         throw "Refusing to clean an output folder outside the project: $outFull"
     }
     $holders = @()
